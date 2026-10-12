@@ -269,6 +269,7 @@ The environment variables are analogous to the script's command line arguments.
 | `MAX_RETRY_COUNT`            | no         | `3`              | Maximum number of times an API call is retried if it timed out before failing.|
 | `THREADS`                    | no         | `4`              | Number of threads to fetch assets with in parallel.<br>Range: `[1..20]`|
 | `RULES_FILE`                 | no         | `-`              | Path to the YAML rule file inside the container, see [Organizer rules](#organizer-rules-this-fork). Without it the script behaves like upstream. |
+| `RULES_YAML`                 | no         | `-`              | The whole rule file as text (a YAML block scalar in a compose file). The container writes it to `/tmp/rules.yaml` and uses that as `RULES_FILE`. For setups where only the app YAML can be edited, such as TrueNAS apps. |
 | `RULES_DRY_RUN`              | no         | `0`              | Set to `1` to only log what the rule file would change. Folder albums are still created. |
 | `QUEUE_API_KEY`              | no         | `-`              | Admin API key used to read the job queues between rule file batches. Defaults to `API_KEY`. |
 
@@ -507,7 +508,7 @@ Since Immich does not support real nested albums ([yet?](https://github.com/immi
 
 This fork adds one YAML rule file that tags assets, adds them to albums and sets their visibility. It also repairs album and tag names that were damaged by a wrong character set, and keeps chosen empty albums alive. Without `--rules-file` (or `RULES_FILE`) the script does exactly what the upstream script does.
 
-Start from [`rules.example.yaml`](rules.example.yaml). A rule has a `match` part and an `actions` part. All keys inside `match` must match (AND). A list value matches when one entry matches (OR). A rule without `match` matches every asset.
+Start from [`rules.example.yaml`](rules.example.yaml). In Docker, either mount the file and set `RULES_FILE`, or put the whole file into the `RULES_YAML` environment variable as a YAML block (`RULES_YAML: |` followed by the indented rule file) when you cannot mount files. A rule has a `match` part and an `actions` part. All keys inside `match` must match (AND). A list value matches when one entry matches (OR). A rule without `match` matches every asset.
 
 ```yaml
 keep_empty_albums: [Screenshots]      # SYNC_MODE never deletes these albums when they are empty

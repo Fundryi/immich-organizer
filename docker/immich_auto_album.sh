@@ -256,6 +256,12 @@ if [ ! -z "$THREADS" ]; then
     args="--threads $THREADS $args"
 fi
 
+# RULES_YAML holds the whole rule file as text, for setups where only the app YAML can be edited (e.g. TrueNAS apps)
+if [ ! -z "$RULES_YAML" ]; then
+    printf '%s\n' "$RULES_YAML" > /tmp/rules.yaml
+    RULES_FILE=/tmp/rules.yaml
+fi
+
 if [ ! -z "$RULES_FILE" ]; then
     args="--rules-file \"$RULES_FILE\" $args"
 fi
