@@ -22,6 +22,9 @@ from immichpy.client.generated import AssetVisibility
 
 BATCH_SIZE = 50
 WATCHED_QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration")
+# Every tag or date write makes Immich write a sidecar and re-read the file's metadata. Waiting for an empty queue
+# after each batch costs 40 s per batch; a bounded backlog keeps Immich busy without flooding it.
+MAX_BACKLOG = 300
 TOP_LEVEL_KEYS = {"keep_empty_albums", "repair_names", "rename_tags", "rename_albums", "rules"}
 # path_like, name_like, make_like and model_like are substrings and extension is an ending, all ignoring case;
 # type and account are exact, ignoring case; name_regex is a case-sensitive regex on the file name.
@@ -447,7 +450,7 @@ class Organizer:
     async def run_rules(self, assets: list[Any]) -> None:
         """
         Plans tags, albums and visibility for the assets, skips what is already done, and unless dry run
-        writes in batches of 50 with a wait for idle Immich queues after each batch. Tag renames run first.
+        writes in batches of 50 and waits after each batch while an Immich queue holds more than MAX_BACKLOG jobs. Tag renames run first.
         Problems that stop the writes are logged, not raised, so the rest of the upstream run still goes on.
         """
         if not (self.config.find_assets_in_albums and self.config.find_archived_assets):
@@ -660,13 +663,13 @@ class Organizer:
                 if queue.is_paused:
                     raise RuntimeError(f"Immich queue {name} is paused, rules stop writing. Resume it and run again.")
                 stats = queue.statistics
-                if stats.active + stats.waiting + stats.delayed:
+                if stats.active + stats.waiting + stats.delayed > MAX_BACKLOG:
                     busy.append(name)
             # A queue missing from the answer is not known to be idle.
             busy += [f"{name} (missing)" for name in WATCHED_QUEUES if name not in seen]
             if not busy:
                 return
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"Immich queues {', '.join(busy)} not idle after {self.idle_timeout:.0f} s, rules stop writing")
+                raise RuntimeError(f"Immich queues {', '.join(busy)} still over {MAX_BACKLOG} jobs after {self.idle_timeout:.0f} s, rules stop writing")
             logging.debug("Waiting for Immich queues %s", busy)
             self.sleep(self.poll_interval)

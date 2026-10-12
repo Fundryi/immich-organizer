@@ -114,7 +114,7 @@ class FakeApi:
             raise self.queue_error
         busy = self.busy_polls > 0
         self.busy_polls -= 1
-        return [NS(name=NS(value=n), is_paused=self.paused, statistics=NS(active=int(busy), waiting=0, delayed=0)) for n in QUEUE_NAMES]
+        return [NS(name=NS(value=n), is_paused=self.paused, statistics=NS(active=1000 if busy else 0, waiting=0, delayed=0)) for n in QUEUE_NAMES]
 
     def names(self):
         return [c[0] for c in self.calls]
@@ -454,7 +454,7 @@ def test_queue_timeout_stops_the_rules_with_an_error(tmp_path, caplog):
     with caplog.at_level(logging.ERROR):
         run(org, [asset()])
     assert "tag_assets" not in api.writes()
-    assert "idle" in caplog.text
+    assert "over 300 jobs" in caplog.text
 
 
 def test_missing_queue_counts_as_busy(tmp_path, caplog):
