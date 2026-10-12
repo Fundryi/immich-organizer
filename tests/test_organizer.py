@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from organizer import Organizer, fix_mojibake, folder_tag_for, matches
+from organizer import Organizer, fix_mojibake, folder_name_for, matches, parse_rule_file
 
 BROKEN = "ŠÛ“Û˜b-ŽQ-"
 FIXED = "丸呑話-参-"
@@ -16,9 +16,9 @@ ME = NS(name="alice", email="alice@example.com")
 QUEUE_NAMES = ["sidecar", "metadataExtraction", "storageTemplateMigration", "thumbnailGeneration"]
 
 
-def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline"):
-    return NS(id=uuid4(), original_path=path, original_file_name=path.rsplit("/", 1)[-1], type=NS(value=kind),
-              visibility=NS(value=vis), width=width, height=height, duration=duration, exif_info=NS(file_size_in_byte=size))
+def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline", camera=(None, None)):
+    return NS(id=uuid4(), original_path=path, original_file_name=path.rsplit("/", 1)[-1], type=NS(value=kind), visibility=NS(value=vis),
+              width=width, height=height, duration=duration, exif_info=NS(file_size_in_byte=size, make=camera[0], model=camera[1]))
 
 
 class FakeApi:
@@ -176,6 +176,19 @@ def test_empty_rule_file_is_valid(tmp_path):
     ("repair_names: yes please\n", "repair_names"),
     ("rules:\n  - match: false\n    actions: {tag: x}\n", "match"),
     ("keep_empty_albums: false\n", "keep_empty_albums"),
+    ("rules:\n  - match: {name_regex: 5}\n    actions: {tag: x}\n", "name_regex"),
+    ("rules:\n  - match: {max_long_side: wide}\n    actions: {tag: x}\n", "max_long_side"),
+    ("rules:\n  - actions: {folder_tag: {strip_prefix: /p/, levels: 1, prefix: 5}}\n", r"folder_tag\.prefix"),
+    ("rules:\n  - actions: {folder_album: {levels: 1}}\n", "folder_album"),
+    ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 0}}\n", "folder_album"),
+    ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 1, prefix: [a]}}\n", r"folder_album\.prefix"),
+    ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 1, separator: ' - '}}\n", "unknown key 'separator'"),
+    ("rules:\n  - actions: {folder_tag: {strip_prefix: /mnt/P, levels: 1}}\n", r"rules\[0\]\.actions\.folder_tag\.strip_prefix"),
+    ("rules:\n  - actions: {album: ''}\n", r"rules\[0\]\.actions\.album"),
+    ("rules:\n  - match: {name_like: [a, '']}\n    actions: {tag: x}\n", r"rules\[0\]\.match\.name_like"),
+    ("rules:\n  - match: {extension: ''}\n    actions: {tag: x}\n", r"rules\[0\]\.match\.extension"),
+    ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 1, sep: x}}\n", "unknown key 'sep'"),
+    ("rules:\n  - actions: {folder_album: /p/}\n", "folder_album"),
 ])
 def test_rule_file_errors(tmp_path, text, message):
     with pytest.raises(ValueError, match=message):
@@ -241,11 +254,74 @@ def test_account_matches_name_or_email():
     assert not matches({"account": "someone"}, asset(), ME)
 
 
+def test_bad_name_regex_names_the_rule(tmp_path):
+    with pytest.raises(ValueError) as error:
+        make(tmp_path, "rules:\n  - actions: {tag: x}\n  - match: {name_regex: ['ok', '(']}\n    actions: {tag: x}\n")
+    assert "rules[1].match.name_regex" in str(error.value)
+    assert "missing )" in str(error.value)
+
+
+def test_too_large_name_regex_names_the_rule(tmp_path):
+    with pytest.raises(ValueError, match=r"rules\[0\]\.match\.name_regex"):
+        make(tmp_path, "rules:\n  - match: {name_regex: 'a{999999999999999999999999}'}\n    actions: {tag: x}\n")
+
+
+def test_name_regex_is_case_sensitive_on_the_original_name():
+    assert matches({"name_regex": r"^IMG_\d+"}, asset("/x/IMG_0001.JPG"), ME)
+    assert not matches({"name_regex": r"^IMG_\d+"}, asset("/x/img_0001.jpg"), ME)
+    assert not matches({"name_regex": "IMG"}, asset("/IMG/a.jpg"), ME)
+
+
+def test_name_regex_list_is_or_and_compiled_once():
+    rule = parse_rule_file({"rules": [{"match": {"name_regex": [r"^\d{6}_p\d+", "^Screenshot"]}, "actions": {"tag": "x"}}]})["rules"][0]
+    assert all(hasattr(pattern, "search") for pattern in rule["match"]["name_regex"])
+    assert matches(rule["match"], asset("/x/123456_p0.png"), ME)
+    assert matches(rule["match"], asset("/x/Screenshot_1.png"), ME)
+    assert not matches(rule["match"], asset("/x/screenshot_1.png"), ME)
+
+
+def test_make_and_model_like():
+    phone = asset(camera=("Google", "Pixel 8 Pro"))
+    assert matches({"make_like": "google", "model_like": ["iphone", "PIXEL 8"]}, phone, ME)
+    assert not matches({"make_like": "apple"}, phone, ME)
+    assert not matches({"make_like": "google"}, asset(), ME)
+    assert not matches({"model_like": "pixel"}, asset(camera=("Google", None)), ME)
+    no_exif = asset()
+    no_exif.exif_info = None
+    assert not matches({"make_like": "google"}, no_exif, ME)
+    assert not matches({"model_like": "pixel"}, no_exif, ME)
+
+
+def test_max_long_side():
+    assert matches({"max_long_side": 1920}, asset(width=1080, height=1920), ME)
+    assert not matches({"max_long_side": 1920}, asset(width=1921, height=1080), ME)
+    assert not matches({"max_long_side": 1920}, asset(), ME)
+    assert not matches({"max_long_side": 1920}, asset(width=1000), ME)
+    assert not matches({"max_long_side": 1920}, asset(height=1000), ME)
+    assert matches({"min_long_side": 1280, "max_long_side": 1920}, asset(width=1280, height=720), ME)
+
+
 def test_folder_tag():
     spec = {"strip_prefix": "/mnt/Pictures/", "levels": 2}
-    assert folder_tag_for(asset("/mnt/Pictures/Vore/artist/x/a.jpg"), spec) == "Vore/artist"
-    assert folder_tag_for(asset("/mnt/Pictures/Vore/a.jpg"), spec) is None
-    assert folder_tag_for(asset("/other/Vore/artist/a.jpg"), spec) is None
+    assert folder_name_for(asset("/mnt/Pictures/Comics/artist/x/a.jpg"), spec) == "Comics/artist"
+    assert folder_name_for(asset("/mnt/Pictures/Comics/a.jpg"), spec) is None
+    assert folder_name_for(asset("/other/Comics/artist/a.jpg"), spec) is None
+    assert folder_name_for(asset("/mnt/Picturesx/Comics/artist/a.jpg"), spec) is None
+
+
+def test_folder_tag_prefix():
+    spec = {"strip_prefix": "/mnt/Creators/", "levels": 1, "prefix": "Source/Creators/"}
+    assert folder_name_for(asset("/mnt/Creators/4242/post/a.jpg"), spec) == "Source/Creators/4242"
+    assert folder_name_for(asset("/mnt/Creators/a.jpg"), spec) is None
+
+
+def test_folder_album_name():
+    def album(path, **extra):
+        rules = parse_rule_file({"rules": [{"actions": {"folder_album": {"strip_prefix": "/mnt/Pictures/", "levels": 2, **extra}}}]})
+        return folder_name_for(asset(path), rules["rules"][0]["actions"]["folder_album"], " / ")
+    assert album("/mnt/Pictures/Comics/Artist/x/a.jpg") == "Comics / Artist"
+    assert album("/mnt/Pictures/Comics/a.jpg") is None
+    assert album("/mnt/Pictures/Comics/Artist/a.jpg", prefix="Art: ") == "Art: Comics / Artist"
 
 
 # Planning, skip logic, writes
@@ -261,10 +337,10 @@ def test_tag_skips_assets_that_already_have_it(tmp_path):
 
 def test_folder_tag_is_created_and_applied(tmp_path):
     api = FakeApi()
-    a = asset("/mnt/Pictures/Vore/artist/a.jpg")
+    a = asset("/mnt/Pictures/Comics/artist/a.jpg")
     text = "rules:\n  - actions: {folder_tag: {strip_prefix: /mnt/Pictures/, levels: 2}}\n"
     run(make(tmp_path, text, api), [a])
-    assert ("upsert_tags", ["Vore/artist"]) in api.calls
+    assert ("upsert_tags", ["Comics/artist"]) in api.calls
     assert api.writes() == ["upsert_tags", "tag_assets"]
 
 
@@ -275,6 +351,19 @@ def test_album_skips_assets_already_in_it(tmp_path):
     run(make(tmp_path, "rules:\n  - match: {path_like: /Twitter/}\n    actions: {album: Twitter}\n", api), [a1, a2])
     assert api.writes() == ["add_assets_to_album"]
     assert ("add_assets_to_album", album.id, [a2.id]) in api.calls
+
+
+def test_folder_album_feeds_the_album_plan_and_skips_done(tmp_path):
+    api = FakeApi()
+    a1, a2 = asset("/mnt/P/Creators/1/a.jpg"), asset("/mnt/P/Creators/1/b.jpg")
+    a3, flat = asset("/mnt/P/Creators/2/c.jpg"), asset("/mnt/P/Creators/d.jpg")
+    album = api.add_album("Src: Creators / 1", members={a1.id})
+    text = "rules:\n  - actions: {folder_album: {strip_prefix: /mnt/P/, levels: 2, prefix: 'Src: '}}\n"
+    run(make(tmp_path, text, api), [a1, a2, a3, flat])
+    assert sorted(api.writes()) == ["add_assets_to_album", "add_assets_to_album", "create_album"]
+    assert ("add_assets_to_album", album.id, [a2.id]) in api.calls
+    created = next(a for a in api.albums if a.album_name == "Src: Creators / 2")
+    assert ("add_assets_to_album", created.id, [a3.id]) in api.calls
 
 
 def test_missing_album_is_created(tmp_path):
@@ -396,8 +485,8 @@ def test_queue_key_connect_failure_writes_nothing(tmp_path, caplog):
 
 @pytest.mark.parametrize("text, expected", [
     (BROKEN, FIXED),
-    ("New / RJ270617 / ŠÛ“Û˜b4 JPG", "New / RJ270617 / 丸呑話4 JPG"),
-    ("Gallery / 2024 / You’re Under Arrest!", None),
+    ("New / RJ123456 / ŠÛ“Û˜b4 JPG", "New / RJ123456 / 丸呑話4 JPG"),
+    ("Albums / 2024 / You’re Welcome!", None),
     ("Café", None),
     ("plain", None),
     ("Mädchen Bären Käse", None),
@@ -514,9 +603,42 @@ def test_rule_tag_that_is_also_repaired_writes_nothing(tmp_path, caplog):
 
 def test_broken_folder_tag_is_repaired(tmp_path):
     api = FakeApi()
-    text = "repair_names: true\nrules:\n  - actions: {folder_tag: {strip_prefix: /mnt/Pictures/, levels: 1}}\n"
+    spec = "{strip_prefix: /mnt/Pictures/, levels: 1}"
+    text = f"repair_names: true\nrules:\n  - actions: {{folder_tag: {spec}, folder_album: {spec}}}\n"
     run(make(tmp_path, text, api), [asset(f"/mnt/Pictures/{BROKEN}/a.jpg")])
     assert ("upsert_tags", [FIXED]) in api.calls
+    assert ("create_album", FIXED) in api.calls
+
+
+def test_folder_repair_is_per_folder(tmp_path):
+    # Neither a non-ASCII prefix nor a correct Japanese sibling folder may block the repair.
+    api = FakeApi()
+    text = ("repair_names: true\nrules:\n  - actions: {folder_tag: {strip_prefix: /mnt/P/, levels: 1, prefix: 'Künstler/'},"
+            " folder_album: {strip_prefix: /mnt/Q/, levels: 2}}\n")
+    run(make(tmp_path, text, api), [asset(f"/mnt/P/{BROKEN}/a.jpg"), asset(f"/mnt/Q/{FIXED}/{BROKEN}/b.jpg")])
+    assert ("upsert_tags", [f"Künstler/{FIXED}"]) in api.calls
+    assert ("create_album", f"{FIXED} / {FIXED}") in api.calls
+
+
+def test_album_name_taken_twice_is_skipped(tmp_path, caplog):
+    api = FakeApi()
+    for name in ("Dup", "Dup", "Twin", "Twin"):
+        api.add_album(name)
+    text = "rules:\n  - actions: {album: Dup, folder_album: {strip_prefix: /mnt/P/, levels: 1}}\n"
+    with caplog.at_level(logging.WARNING):
+        run(make(tmp_path, text, api), [asset("/mnt/P/Twin/a.jpg")])
+    assert not api.writes()
+    assert "named 'Dup'" in caplog.text and "named 'Twin'" in caplog.text
+
+
+def test_repaired_folder_album_waits_for_the_broken_album_rename(tmp_path, caplog):
+    api = FakeApi()
+    api.add_album(BROKEN)
+    text = "repair_names: true\nrules:\n  - actions: {folder_album: {strip_prefix: /mnt/P/, levels: 1}}\n"
+    with caplog.at_level(logging.WARNING):
+        run(make(tmp_path, text, api), [asset(f"/mnt/P/{BROKEN}/a.jpg")])
+    assert not api.writes()
+    assert "rename it first" in caplog.text
 
 
 def test_tag_repair_keeps_old_tag_when_copy_failed(tmp_path):
@@ -525,3 +647,29 @@ def test_tag_repair_keeps_old_tag_when_copy_failed(tmp_path):
     api.tag_assets = lambda tag_id, ids: None
     run(make(tmp_path, "rename_tags: {Old: New}\n", api), [])
     assert api.writes() == ["upsert_tags"]
+
+
+def test_path_not_like_excludes_folders():
+    assert matches({"path_not_like": ["/Twitter/"]}, asset("/lib/Download/a.jpg"), ME)
+    assert not matches({"path_not_like": ["/twitter/"]}, asset("/lib/Twitter/a.jpg"), ME)
+
+
+def test_max_size_mb_boundary_and_unknown_size():
+    assert matches({"max_size_mb": 100}, asset(size=100 * 1024 * 1024), ME)
+    assert not matches({"max_size_mb": 100}, asset(size=100 * 1024 * 1024 + 1), ME)
+    assert not matches({"max_size_mb": 100}, asset(size=None), ME)
+
+
+def test_capture_group_tag(tmp_path):
+    api = FakeApi()
+    text = chr(10).join(["rules:", "  - match:", "      name_regex: ['" + r"^1\d{9}\.([a-z0-9~.-]+)_" + "']", "    actions:", "      tag: ['Source/Example', 'Artist/{1}']"])
+    org = make(tmp_path, text, api=api, dry_run=True)
+    plan = org._plan([asset("/lib/1700000000.some-artist_title.jpg"), asset("/lib/1700000000._title.jpg"), asset("/lib/other.jpg")])[0]  # pylint: disable=protected-access
+    assert len(plan["Artist/some-artist"]) == 1
+    assert len(plan["Source/Example"]) == 1
+    assert "Artist/" not in "".join(k for k in plan if k != "Artist/some-artist")
+
+
+def test_capture_tag_without_regex_is_rejected():
+    with pytest.raises(ValueError, match="capture"):
+        parse_rule_file({"rules": [{"match": {"path_like": ["/x/"]}, "actions": {"tag": "Artist/{1}"}}]})

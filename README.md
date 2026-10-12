@@ -518,20 +518,29 @@ rename_albums: {}                     # old album name -> new album name
 rules:
   - match:
       path_like: ["/Twitter/"]        # case-insensitive substring of the whole asset path, file name included: wrap folder names in slashes
+      path_not_like: ["/Reddit/"]     # the opposite: no match when one of these is in the path
       name_like: ["Screenshot"]       # case-insensitive substring of the file name
       extension: [".gif"]
       type: VIDEO                     # IMAGE or VIDEO
-      min_size_mb: 100
-      min_long_side: 3840             # the longer side in pixels
+      name_regex: ['^IMG_\d{4}\.']        # Python regex on the original file name, case-sensitive; use single quotes in YAML
+      make_like: ["Canon", "iPhone"]  # case-insensitive substring of the EXIF camera make
+      model_like: ["CanoScan"]        # same for the EXIF model
+      min_size_mb: 25
+      max_size_mb: 100                # both together give a size range
+      min_long_side: 3840             # the longer side in pixels, at least
+      max_long_side: 7679             # the longer side in pixels, at most (both together give a resolution tier)
       min_duration_s: 600
       max_duration_s: 10
       account: alice                  # name or email of the user the API key belongs to
     actions:
-      tag: "Source/Twitter"           # one tag or a list, a path creates the parent tag
-      folder_tag: {strip_prefix: "/mnt/pictures/", levels: 2}   # /mnt/pictures/Comics/Artist/x.jpg gets the tag Comics/Artist
+      tag: ["Source/Twitter", "Artist/{1}"]   # one tag or a list, a path creates the parent tag; {1} to {9} insert the groups of the first matching name_regex
+      folder_tag: {strip_prefix: "/mnt/pictures/", levels: 2, prefix: "Folder/"}   # /mnt/pictures/Comics/Artist/x.jpg gets the tag Folder/Comics/Artist
       album: "Twitter"
+      folder_album: {strip_prefix: "/mnt/pictures/Trips/", levels: 1, prefix: "Trips / "}   # one album per trip folder
       visibility: archive             # archive, hidden or timeline
 ```
+
+`folder_tag` and `folder_album` take the first `levels` folders after `strip_prefix` (which must end with `/`, never the file name) and join them with `/` for a tag or with ` / ` for an album; `prefix` goes in front. Fewer folders than `levels` means no tag or album for that asset.
 
 How a run works:
 

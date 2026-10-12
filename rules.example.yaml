@@ -1,5 +1,7 @@
 # Immich organizer rule file. Copy to rules.yaml, set RULES_FILE to its path.
-keep_empty_albums: [Screenshots, AyuGram]   # SYNC_MODE never deletes these as empty
+# Match keys AND together, list values OR. Text keys are case-insensitive substrings,
+# except name_regex (Python re.search on the original file name, case-sensitive).
+keep_empty_albums: [Screenshots]   # SYNC_MODE never deletes these as empty
 repair_names: true                           # fix Shift_JIS-as-Windows-1252 album and tag names automatically
 rename_tags: {}                              # old name -> new name, e.g. {"Kind/Scr\uFFFDen": "Kind/Screen"}
 rename_albums: {}                            # same for albums
@@ -9,185 +11,313 @@ rules:
       extension: [".gif"]
     actions:
       tag: "GIF"
-
   - match:
       type: VIDEO
     actions:
       tag: "Video"
-
   # Format
   - match:
       extension: [".png"]
     actions:
       tag: "Format/PNG"
-
   - match:
       extension: [".webp"]
     actions:
       tag: "Format/WEBP"
-
   - match:
       extension: [".webm"]
     actions:
       tag: "Format/WEBM"
-
   - match:
       extension: [".psd"]
     actions:
       tag: "Format/PSD"
-
   # Source (folder name in the original path; check folder names on the server)
   - match:
       path_like: ["/Twitter/", "/TweetDownloader/"]
     actions:
       tag: "Source/Twitter"
-
   - match:
       path_like: ["/Reddit/"]
     actions:
       tag: "Source/Reddit"
-
   - match:
       path_like: ["/pixiv/"]
     actions:
       tag: "Source/pixiv"
-
-  - match:
-      path_like: ["/Fanbox/", "/Fanbox Downloads/"]
-    actions:
-      tag: "Source/Fanbox"
-
   - match:
       path_like: ["/Bluesky/"]
     actions:
       tag: "Source/Bluesky"
-
   - match:
       path_like: ["/Tumblr/"]
     actions:
       tag: "Source/Tumblr"
-
   - match:
       path_like: ["/Imgur/"]
     actions:
       tag: "Source/Imgur"
-
   - match:
       path_like: ["/MEGA/", "/MEGA Downloads/"]
     actions:
       tag: "Source/MEGA"
-
   - match:
       path_like: ["/9GAG/"]
     actions:
       tag: "Source/9GAG"
-
   - match:
       path_like: ["/TikTok/"]
     actions:
       tag: "Source/TikTok"
-
   - match:
       path_like: ["/Instagram/"]
     actions:
       tag: "Source/Instagram"
-
   - match:
       path_like: ["/Snapchat/"]
     actions:
       tag: "Source/Snapchat"
-
   - match:
       path_like: ["/WhatsApp/"]
     actions:
       tag: "Source/WhatsApp"
-
   - match:
       path_like: ["/Telegram/"]
     actions:
       tag: "Source/Telegram"
-
   - match:
       path_like: ["/Discord/"]
     actions:
       tag: "Source/Discord"
-
   - match:
       path_like: ["/ChatGPT/"]
     actions:
       tag: "Source/ChatGPT"
-
   - match:
       path_like: ["/Kleinanzeigen/"]
     actions:
       tag: "Source/Kleinanzeigen"
-
-  # Kind (check folder names on the server)
+  # Source from the file name (for files in unsourced folders like Download, Other, Everything).
+  # Single quotes keep the backslashes literal.
+  # Twitter: tweet id (19 digits), tweet id as float, pbs.twimg.com media key, TweetDownloader name
   - match:
-      path_like: ["/Camera/", "/DCIM/"]
+      path_not_like: &sourced ["/Twitter/", "/TweetDownloader/", "/Reddit/", "/pixiv/", "/Fanbox/", "/Fanbox Downloads/", "/Bluesky/", "/Imgur/", "/MEGA/", "/MEGA Downloads/", "/9GAG/", "/Tumblr/", "/Instagram/", "/TikTok/", "/Snapchat/", "/WhatsApp/", "/Telegram/", "/Discord/", "/ChatGPT/", "/Kleinanzeigen/"]   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^[12]\d{18}(?:[-_]\d{1,2}|_\d{2,4}x\d{2,4})?\.\w+$'
+        - '^1\.\d{8,17}E18\.\w+$'
+        - '^(?=[^.]*[A-Za-z])[A-Za-z0-9_-]{9}A[A-Za-z0-9_-]{5}(?:[_.-]?(?:orig|large|medium|4096x4096))?.(?i:jpe?g|png|webp)$'
+        - '^[A-Za-z0-9_]+_(?:\d{3,4}p|\d{3,4}x\d{3,4}|\d)_20\d{6}_\d{6}\.\w+$'
+    actions:
+      tag: "Source/Twitter"
+  # pixiv: <id>_p<page>, ugoira, app save
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^\d{6,9}_p\d+(?:_master1200|_square1200|_custom1200)?\.\w+$'
+        - '^\d{6,9}_ugoira\d+x\d+\.\w+$'
+        - '^illust_\d{6,9}_\d{8}_\d{6}'
+    actions:
+      tag: "Source/pixiv"
+  - match:
+      path_like: ["/Fanbox/"]
+    actions:
+      tag: "Source/Fanbox"
+
+  # Fanbox downloader: _p<n>[ - date]
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^_p\d+(?: - \d{4}-\d{2}-\d{2})?\.\w+$'
+    actions:
+      tag: "Source/Fanbox"
+  # DeviantArt: <title>_by_<artist>_d<id>, FA and HF mirrors excluded
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '(?i)^(?!1\d{9}\.)(?![A-Za-z][A-Za-z0-9_]*-\d{3,7}-).*_by_[a-z0-9\-]+[_-]d[a-z0-9]{6}(?:-\w+)?\.\w+$'
+    actions:
+      tag: "Source/DeviantArt"
+  # Reddit: app save RDT_, i.redd.it media id
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^RDT_\d{8}_\d{6,}\.\w+$'
+        - '^(?=(?:[a-z]*\d){2})(?=[a-z0-9]*[a-z])(?![a-z]+\d+\.)[a-z0-9]{12}1.(?i:jpe?g|png|gif|webp|mp4)$'
+    actions:
+      tag: "Source/Reddit"
+  # Tumblr: CDN name tumblr_<hash>, app save Tumblr_l_
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '(?i)^tumblr_(?:inline_)?[a-z0-9]{10,}(?:_r\d)?(?:_\d{2,4})?\.\w+$'
+        - '^Tumblr_l_\d{10,}\.\w+$'
+    actions:
+      tag: "Source/Tumblr"
+  # Bluesky: IPFS CID bafkrei...
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^bafkrei[a-z2-7]{20,}'
+    actions:
+      tag: "Source/Bluesky"
+  # Discord: image0.jpg, unknown.png, SPOILER_ prefix
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^(?:image\d*|unknown\d*|SPOILER_.+).(?i:png|jpe?g|gif|webp|mp4)$'
+    actions:
+      tag: "Source/Discord"
+  # Telegram: Desktop export name, Android save with milliseconds
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^(?:photo|video|file|sticker)_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}'
+        - '^(?:IMG|VID)_\d{8}_\d{6}_\d{3}\.\w+$'
+    actions:
+      tag: "Source/Telegram"
+  # WhatsApp: IMG-<date>-WA<n>
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^(?:IMG|VID|AUD|PTT|STK)-\d{8}-WA\d{4}'
+    actions:
+      tag: "Source/WhatsApp"
+  # AI generators: A1111/Forge <counter>-<seed>, ComfyUI <prefix>_<counter>_, AIFoto app
+  - match:
+      path_not_like: *sourced   # file-name rules only run outside folders that already name the source
+      name_regex:
+        - '^\d{5}-\d{6,10}(?:-.+)?.(?i:png|jpe?g|webp)$'
+        - '^(?:ComfyUI_\d{4,5}_?|[A-Za-z0-9_]+_\d{5}_).(?i:png|jpe?g|webp|gif|mp4|webm)$'
+        - '^AIFoto_\d{8}_\d+'
+    actions:
+      tag: "Kind/AI generated"
+  # Optional file name rules, off by default (low confidence or known false positives)
+  # Twitter app save YYYYMMDD_HHMMSS: Samsung camera files share the shape, 16 of 140 unsourced hits are camera photos
+  # - match:
+  #     name_regex:
+  #       - '^20\d{6}_\d{6}.(?i:jpe?g|png|gif|mp4|webp)$'
+  #   actions:
+  #     tag: "Source/Twitter"
+  #
+  # DeviantArt _by_<artist> without the DA id: low, matches normal English like disctracted_by_fire.png
+  # - match:
+  #     name_regex:
+  #       - '(?i)^(?!1\d{9}\.)(?![A-Za-z][A-Za-z0-9_]*-\d{3,7}-).+_by_[a-z0-9\-]+\.\w+$'
+  #   actions:
+  #     tag: "Source/DeviantArt"
+  #
+  # Imgur 7 char id: low, a random 7 char name could come from any host
+  # - match:
+  #     name_regex:
+  #       - '^(?![A-Za-z]+\d+\.)(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{7}.(?i:jpe?g|png|gif|gifv|mp4)$'
+  #   actions:
+  #     tag: "Source/Imgur"
+  #
+  # Discord 18 digit id: medium, could also be 2014-17 tweets or Tumblr post ids, only resolution says Discord
+  # - match:
+  #     name_regex:
+  #       - '^[3-9]\d{17}(?:[-_]\d{1,2})?\.\w+$'
+  #   actions:
+  #     tag: "Source/Discord"
+  # Kind
+  # Camera from EXIF. Not make "Apple": "Apple Computer Inc." is macOS software on web downloads.
+  - match:
+      model_like: ["iPhone", "iPad", "iPod"]
     actions:
       tag: "Kind/Camera"
-
+  - match:
+      make_like: ["samsung", "LG Electronics", "SONY", "NIKON", "OLYMPUS", "HTC", "OnePlus", "Xiaomi", "Google", "Motorola", "Panasonic", "FUJIFILM", "KODAK", "PENTAX", "BlackBerry"]
+    actions:
+      tag: "Kind/Camera"
+  # Canon cameras by model; Canon also makes the scanners
+  - match:
+      model_like: ["Canon EOS", "PowerShot", "IXUS"]
+    actions:
+      tag: "Kind/Camera"
+  # Scanner from EXIF
+  - match:
+      model_like: ["CanoScan", "LiDE ", "Scanjet", "MX870", "Stylus SX", "ScanSnap"]
+    actions:
+      tag: "Kind/Scan"
+  - match:
+      make_like: ["CanoScan", "FUJITSU"]
+    actions:
+      tag: "Kind/Scan"
   - match:
       path_like: ["/Screenshots/"]
     actions:
       tag: "Kind/Screenshot"
-
   - match:
       name_like: ["Screenshot"]
     actions:
       tag: "Kind/Screenshot"
-
   - match:
       path_like: ["/Screen recordings/", "/ScreenRecorder/", "/Screen Recordings/"]
     actions:
       tag: "Kind/Screen recording"
-
   - match:
       name_like: ["Screen recording", "Screen_Recording", "ScreenRecording"]
     actions:
       tag: "Kind/Screen recording"
-
+  # Size
   - match:
-      path_like: ["/Adobe Scan/"]
+      min_size_mb: 25
+      max_size_mb: 100
     actions:
-      tag: "Kind/Scan"
-
-  - match:
-      name_like: ["CanoScan"]
-    actions:
-      tag: "Kind/Scan"
-
-  # Size, resolution, length
+      tag: "Size/25 to 100MB"
   - match:
       min_size_mb: 100
     actions:
       tag: "Size/Over 100MB"
-
+  # Resolution by the longer side, images and videos alike
+  - match:
+      min_long_side: 7680
+    actions:
+      tag: "Resolution/8K"
   - match:
       min_long_side: 3840
+      max_long_side: 7679
     actions:
       tag: "Resolution/4K"
-
+  - match:
+      min_long_side: 2560
+      max_long_side: 3839
+    actions:
+      tag: "Resolution/2K"
+  - match:
+      min_long_side: 1920
+      max_long_side: 2559
+    actions:
+      tag: "Resolution/Full HD"
+  - match:
+      min_long_side: 1280
+      max_long_side: 1919
+    actions:
+      tag: "Resolution/HD"
+  - match:
+      max_long_side: 1279
+    actions:
+      tag: "Resolution/Low"
+  # Length
   - match:
       type: VIDEO
       min_duration_s: 600
     actions:
       tag: "Length/Over 10 min"
-
   - match:
       type: VIDEO
       max_duration_s: 10
     actions:
       tag: "Length/Under 10 sec"
 
-  # Examples of the other actions (uncomment to use)
+  # Examples of the folder actions and the other actions (uncomment to use)
   # - match:
-  #     path_like: ["/Pictures/"]
+  #     path_like: ["/Trips/"]
   #   actions:
-  #     folder_tag: {strip_prefix: "/mnt/IMMICH-DATA-UPLOAD/Pictures/", levels: 2}   # .../Pictures/Comics/Artist/x.jpg -> tag Comics/Artist
+  #     folder_tag: {strip_prefix: "/mnt/photos/Trips/", levels: 1, prefix: "Trip/"}      # /mnt/photos/Trips/Norway/x.jpg gets the tag Trip/Norway
+  #     folder_album: {strip_prefix: "/mnt/photos/Trips/", levels: 1, prefix: "Trips / "}  # and the album "Trips / Norway"
   # - match:
-  #     path_like: ["/Twitter/"]
+  #     path_like: ["/Screenshots/"]
   #   actions:
-  #     album: "Twitter"           # created if missing
+  #     album: "Screenshots"       # created if missing
   #     visibility: archive        # archive, hidden or timeline

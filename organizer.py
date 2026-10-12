@@ -11,7 +11,7 @@ import logging
 import re
 import time
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Callable
 
 import yaml
@@ -20,9 +20,14 @@ from immichpy.client.generated import AssetVisibility
 BATCH_SIZE = 50
 WATCHED_QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration")
 TOP_LEVEL_KEYS = {"keep_empty_albums", "repair_names", "rename_tags", "rename_albums", "rules"}
-TEXT_MATCH_KEYS = {"path_like", "name_like", "extension", "type", "account"}
-NUMBER_MATCH_KEYS = {"min_size_mb", "min_long_side", "min_duration_s", "max_duration_s"}
-ACTION_KEYS = {"tag", "folder_tag", "album", "visibility"}
+# path_like, name_like, make_like and model_like are substrings and extension is an ending, all ignoring case;
+# type and account are exact, ignoring case; name_regex is a case-sensitive regex on the file name.
+TEXT_MATCH_KEYS = {"path_like", "path_not_like", "name_like", "name_regex", "extension", "type", "account", "make_like", "model_like"}
+NUMBER_MATCH_KEYS = {"min_size_mb", "max_size_mb", "min_long_side", "max_long_side", "min_duration_s", "max_duration_s"}
+TAG_GROUP = re.compile(r"\{(\d)\}")
+ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility"}
+FOLDER_ACTIONS = ("folder_tag", "folder_album")
+ALBUM_SEPARATOR = " / "
 VISIBILITIES = {"archive", "hidden", "timeline"}
 ASSET_TYPES = {"IMAGE", "VIDEO"}
 CJK_CHARS = re.compile("[぀-ヿ一-鿿！-｠]")
@@ -85,9 +90,19 @@ def _check_keys(where: str, data: Any, allowed: set[str]) -> None:
 
 def _check_texts(where: str, value: Any) -> list[str]:
     values = as_list(value)
-    if not values or not all(isinstance(v, str) for v in values):
-        _fail(where, "must be a string or a list of strings")
+    if not values or not all(isinstance(v, str) and v for v in values):
+        _fail(where, "must be a non-empty string or a list of non-empty strings")
     return values
+
+
+def _check_tags(where: str, match: dict[str, Any], actions: dict[str, Any]) -> bool:
+    """Checks the tag action and returns True when a tag uses regex groups like {1}."""
+    if "tag" not in actions:
+        return False
+    captures = any(TAG_GROUP.search(tag) for tag in _check_texts(f"{where}.actions.tag", actions["tag"]))
+    if captures and "name_regex" not in match:
+        _fail(f"{where}.actions.tag", "a tag with {1}..{9} needs a name_regex with capture groups")
+    return captures
 
 
 def _check_rule(where: str, rule: Any) -> dict[str, Any]:
@@ -106,21 +121,39 @@ def _check_rule(where: str, rule: Any) -> dict[str, Any]:
             _fail(f"{where}.match.type", f"must be one of {', '.join(sorted(ASSET_TYPES))}")
         if key == "extension" and not all(v.startswith(".") for v in values):
             _fail(f"{where}.match.extension", "must start with a dot, e.g. '.gif'")
+    if "name_regex" in match:
+        match = {**match, "name_regex": [_compile(f"{where}.match.name_regex", pattern) for pattern in as_list(match["name_regex"])]}
     actions = rule["actions"]
     _check_keys(f"{where}.actions", actions, ACTION_KEYS)
-    if "tag" in actions:
-        _check_texts(f"{where}.actions.tag", actions["tag"])
-    if "album" in actions and not isinstance(actions["album"], str):
-        _fail(f"{where}.actions.album", "must be a string")
+    captures = _check_tags(where, match, actions)
+    if "album" in actions and (not isinstance(actions["album"], str) or not actions["album"]):
+        _fail(f"{where}.actions.album", "must be a non-empty string")
     if "visibility" in actions and actions["visibility"] not in VISIBILITIES:
         _fail(f"{where}.actions.visibility", f"must be one of {', '.join(sorted(VISIBILITIES))}")
-    if "folder_tag" in actions:
-        spec = actions["folder_tag"]
-        _check_keys(f"{where}.actions.folder_tag", spec, {"strip_prefix", "levels"})
-        levels = spec.get("levels")
-        if not isinstance(spec.get("strip_prefix"), str) or isinstance(levels, bool) or not isinstance(levels, int) or levels < 1:
-            _fail(f"{where}.actions.folder_tag", "needs strip_prefix (string) and levels (whole number from 1)")
-    return {"match": match, "actions": actions}
+    for key in FOLDER_ACTIONS:
+        if key in actions:
+            actions = {**actions, key: _check_folder_spec(f"{where}.actions.{key}", actions[key])}
+    return {"match": match, "actions": actions, "captures": captures}
+
+
+def _compile(where: str, pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(pattern)
+    except (re.error, OverflowError, RecursionError) as e:
+        raise ValueError(f"Rule file, {where}: bad regex '{pattern}': {e}") from e
+
+
+def _check_folder_spec(where: str, spec: Any) -> dict[str, Any]:
+    _check_keys(where, spec, {"strip_prefix", "levels", "prefix"})
+    levels = spec.get("levels")
+    if not isinstance(spec.get("strip_prefix"), str) or isinstance(levels, bool) or not isinstance(levels, int) or levels < 1:
+        _fail(where, "needs strip_prefix (string) and levels (whole number from 1)")
+    if not spec["strip_prefix"].endswith("/"):
+        # Else /mnt/Photos also matches /mnt/Photosx/.
+        _fail(f"{where}.strip_prefix", "must end with '/'")
+    if not isinstance(spec.get("prefix", ""), str):
+        _fail(f"{where}.prefix", "must be a string")
+    return {"prefix": "", **spec}
 
 
 def parse_rule_file(data: Any) -> dict[str, Any]:
@@ -156,32 +189,71 @@ def parse_rule_file(data: Any) -> dict[str, Any]:
 
 
 def _matches_number(key: str, value: float, asset: Any) -> bool:
-    if key == "min_size_mb":
+    if key in ("min_size_mb", "max_size_mb"):
         size = asset.exif_info.file_size_in_byte if asset.exif_info else None
-        return size is not None and size >= value * 1024 * 1024
+        if size is None:
+            return False
+        return size >= value * 1024 * 1024 if key == "min_size_mb" else size <= value * 1024 * 1024
     if key == "min_long_side":
         return max(asset.width or 0, asset.height or 0) >= value
+    if key == "max_long_side":
+        # An unknown width or height could be the long side, which is no match.
+        return (asset.width or 0) > 0 and (asset.height or 0) > 0 and max(asset.width, asset.height) <= value
     if asset.duration is None:
         return False
     seconds = asset.duration / 1000
     return seconds >= value if key == "min_duration_s" else seconds <= value
 
 
-def _matches_key(key: str, value: Any, asset: Any, me: Any) -> bool:
-    if key in NUMBER_MATCH_KEYS:
-        return _matches_number(key, value, asset)
-    wanted = [v.lower() for v in as_list(value)]
-    if key == "path_like":
+def _matches_text(key: str, wanted: list[str], asset: Any) -> bool:
+    if key in ("make_like", "model_like"):
+        # No EXIF or no value is no match.
+        text = getattr(asset.exif_info, key.removesuffix("_like")) if asset.exif_info else None
+        return bool(text) and any(w in text.lower() for w in wanted)
+    if key in ("path_like", "path_not_like"):
         path = (asset.original_path or "").lower()
-        return any(w in path for w in wanted)
+        return any(w in path for w in wanted) == (key == "path_like")
     name = (asset.original_file_name or "").lower()
     if key == "name_like":
         return any(w in name for w in wanted)
-    if key == "extension":
-        return name.endswith(tuple(wanted))
+    return name.endswith(tuple(wanted))
+
+
+def _matches_key(key: str, value: Any, asset: Any, me: Any) -> bool:
+    if key in NUMBER_MATCH_KEYS:
+        return _matches_number(key, value, asset)
+    if key == "name_regex":
+        # Case-sensitive on the original name; re.search takes the compiled patterns of a parsed rule and plain strings alike.
+        return any(re.search(pattern, asset.original_file_name or "") for pattern in as_list(value))
+    wanted = [v.lower() for v in as_list(value)]
     if key == "type":
         return asset.type.value.lower() in wanted
-    return (me.name or "").lower() in wanted or (me.email or "").lower() in wanted
+    if key == "account":
+        return (me.name or "").lower() in wanted or (me.email or "").lower() in wanted
+    return _matches_text(key, wanted, asset)
+
+
+def regex_groups(match: dict[str, Any], asset: Any) -> tuple[str | None, ...]:
+    """The groups of the first name_regex pattern of match that matches the asset's file name, else an empty tuple."""
+    for pattern in as_list(match.get("name_regex", [])):
+        found = re.search(pattern, asset.original_file_name or "")
+        if found:
+            return found.groups()
+    return ()
+
+
+def fill_tag(tag: str, groups: tuple[str | None, ...]) -> str | None:
+    """Replaces {1}..{9} in a tag with the regex groups. An empty group, or one with a slash, gives no tag."""
+    def group(found: re.Match[str]) -> str:
+        index = int(found.group(1)) - 1
+        value = groups[index] if index < len(groups) else None
+        if not value or "/" in value:
+            raise LookupError
+        return value
+    try:
+        return TAG_GROUP.sub(group, tag)
+    except LookupError:
+        return None
 
 
 def matches(match: dict[str, Any], asset: Any, me: Any) -> bool:
@@ -193,17 +265,24 @@ def matches(match: dict[str, Any], asset: Any, me: Any) -> bool:
     return all(_matches_key(key, value, asset, me) for key, value in match.items())
 
 
-def folder_tag_for(asset: Any, spec: dict[str, Any]) -> str | None:
+def folder_name_for(asset: Any, spec: dict[str, Any], separator: str = "/", repair: bool = False) -> str | None:
     """
-    Builds a tag from the first spec['levels'] folders after spec['strip_prefix'] in the asset path.
+    Builds a tag path or album name from the first spec['levels'] folders after spec['strip_prefix'] in the asset path,
+    joined by separator, with the optional spec['prefix'] in front. With repair each folder goes through fix_mojibake
+    on its own, so neither the prefix nor a correct Japanese sibling folder blocks the repair.
 
-    :returns: The tag path, or None when the path does not start with the prefix or has too few folders
+    :returns: The name, or None when the path does not start with strip_prefix or has too few folders
     """
     path = asset.original_path or ""
     if not path.startswith(spec["strip_prefix"]):
         return None
     folders = [part for part in path[len(spec["strip_prefix"]):].split("/")[:-1] if part]
-    return "/".join(folders[:spec["levels"]]) if len(folders) >= spec["levels"] else None
+    if len(folders) < spec["levels"]:
+        return None
+    folders = folders[:spec["levels"]]
+    if repair:
+        folders = [fix_mojibake(folder) or folder for folder in folders]
+    return spec.get("prefix", "") + separator.join(folders)
 
 
 def _first_by_name(albums: list[Any]) -> dict[str, Any]:
@@ -212,6 +291,21 @@ def _first_by_name(albums: list[Any]) -> dict[str, Any]:
     for album in albums:
         by_name.setdefault(nfc(album.album_name), album)
     return by_name
+
+
+def _drop_unsafe_albums(album_plan: dict[str, set[Any]], raw_names: dict[str, str], fetched: list[Any]) -> dict[str, Any]:
+    """Drops planned albums whose name is taken twice or whose broken name still exists, and returns the albums by name."""
+    counts = Counter(nfc(album.album_name) for album in fetched)
+    albums = _first_by_name(fetched)
+    for name in list(album_plan):
+        if counts[name] > 1:
+            logging.warning("Rules: %d albums are named '%s', skipping it (no merge)", counts[name], name)
+        elif raw_names.get(name) in albums:
+            logging.warning("Rules: album '%s' still exists, rename it first; skipping '%s'", raw_names[name], name)
+        else:
+            continue
+        del album_plan[name]
+    return albums
 
 
 def _log_plan(repairs: list[tuple[Any, str]], tag_plan: dict[str, set[Any]], album_plan: dict[str, set[Any]], visibility_plan: dict[str, set[Any]]) -> tuple[int, ...]:
@@ -303,11 +397,11 @@ class Organizer:
         if not (self.config.find_assets_in_albums and self.config.find_archived_assets):
             logging.warning("Rules see only part of the library: turn on FIND_ASSETS_IN_ALBUMS and FIND_ARCHIVED_ASSETS to cover assets in albums and archived assets")
         tags = {nfc(tag.value): tag for tag in self.api_client.fetch_tags()}
-        tag_plan, album_plan, visibility_plan = self._plan(assets)
+        tag_plan, album_plan, visibility_plan, raw_album_names = self._plan(assets)
         repairs = self._plan_tag_repairs(list(tags.values()))
         # Checked before the skip: else a rule whose assets all carry the broken tag re-tags them after every repair.
         conflicts = sorted(tag.value for tag, _ in repairs if nfc(tag.value) in tag_plan)
-        albums = _first_by_name(self.api_client.fetch_albums()) if album_plan else {}
+        albums = _drop_unsafe_albums(album_plan, raw_album_names, self.api_client.fetch_albums()) if album_plan else {}
         tag_plan, album_plan = self._skip_done(tag_plan, album_plan, tags, albums)
         totals = _log_plan(repairs, tag_plan, album_plan, visibility_plan)
         if conflicts:
@@ -361,37 +455,45 @@ class Organizer:
         if queue_client is not self.api_client:
             await queue_client.__aexit__(None, None, None)
 
-    def _plan(self, assets: list[Any]) -> tuple[dict[str, set[Any]], dict[str, set[Any]], dict[str, set[Any]]]:
+    def _plan(self, assets: list[Any]) -> tuple[dict[str, set[Any]], dict[str, set[Any]], dict[str, set[Any]], dict[str, str]]:
         me = self.api_client.fetch_my_user()
         tag_plan: dict[str, set[Any]] = defaultdict(set)
         album_plan: dict[str, set[Any]] = defaultdict(set)
         visibility_plan: dict[str, set[Any]] = defaultdict(set)
+        raw_album_names: dict[str, str] = {}
         for asset in assets:
             visibilities = []
             for rule in self.rules["rules"]:
                 if not matches(rule["match"], asset, me):
                     continue
                 actions = rule["actions"]
-                paths = as_list(actions.get("tag", []))
+                paths = [fill_tag(path, regex_groups(rule["match"], asset) if rule["captures"] else ()) for path in as_list(actions.get("tag", []))]
                 if "folder_tag" in actions:
-                    folder_tag = folder_tag_for(asset, actions["folder_tag"])
-                    if folder_tag and self.rules["repair_names"]:
-                        # Else a broken folder name creates the broken tag again on every run.
-                        folder_tag = fix_mojibake(folder_tag) or folder_tag
-                    paths = paths + [folder_tag]
+                    paths = paths + [folder_name_for(asset, actions["folder_tag"], repair=self.rules["repair_names"])]
                 for path in filter(None, paths):
                     tag_plan[nfc(path)].add(asset.id)
-                if "album" in actions:
-                    album_plan[nfc(actions["album"])].add(asset.id)
+                names = [actions["album"]] if "album" in actions else []
+                if "folder_album" in actions:
+                    names.append(self._folder_album(asset, actions["folder_album"], raw_album_names))
+                for name in filter(None, names):
+                    album_plan[nfc(name)].add(asset.id)
                 if "visibility" in actions:
                     visibilities.append(actions["visibility"])
             if len(set(visibilities)) > 1:
                 logging.warning("Rules give %s more than one visibility, the last matching rule wins", asset.original_path)
             if visibilities and asset.visibility.value != visibilities[-1]:
                 visibility_plan[visibilities[-1]].add(asset.id)
-        for path, ids in sorted(tag_plan.items()):
-            logging.info("Rules: tag '%s' matches %d assets", path, len(ids))
-        return tag_plan, album_plan, visibility_plan
+        for path in sorted(tag_plan):
+            logging.info("Rules: tag '%s' matches %d assets", path, len(tag_plan[path]))
+        return tag_plan, album_plan, visibility_plan, raw_album_names
+
+    def _folder_album(self, asset: Any, spec: dict[str, Any], raw_names: dict[str, str]) -> str | None:
+        # Repaired, else a broken folder name creates the broken album again on every run.
+        name = folder_name_for(asset, spec, ALBUM_SEPARATOR, self.rules["repair_names"])
+        raw = folder_name_for(asset, spec, ALBUM_SEPARATOR)
+        if name and raw and name != raw:
+            raw_names[nfc(name)] = nfc(raw)
+        return name
 
     def _skip_done(self, tag_plan: dict[str, set[Any]], album_plan: dict[str, set[Any]], tags: dict[str, Any], albums: dict[str, Any]) -> tuple[dict[str, set[Any]], dict[str, set[Any]]]:
         for path, ids in tag_plan.items():
