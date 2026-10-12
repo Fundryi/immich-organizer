@@ -3,3 +3,13 @@
 
 .history
 .venv/
+# local AI working files, never pushed (public fork, upstream has no license)
+AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+PLAN.md
+.claude/
+.roam/
+.local/
+__pycache__/
+.pytest_cache/

@@ -1,0 +1,193 @@
+# Immich organizer rule file. Copy to rules.yaml, set RULES_FILE to its path.
+keep_empty_albums: [Screenshots, AyuGram]   # SYNC_MODE never deletes these as empty
+repair_names: true                           # fix Shift_JIS-as-Windows-1252 album and tag names automatically
+rename_tags: {}                              # old name -> new name, e.g. {"Kind/Scr\uFFFDen": "Kind/Screen"}
+rename_albums: {}                            # same for albums
+rules:
+  # Top level
+  - match:
+      extension: [".gif"]
+    actions:
+      tag: "GIF"
+
+  - match:
+      type: VIDEO
+    actions:
+      tag: "Video"
+
+  # Format
+  - match:
+      extension: [".png"]
+    actions:
+      tag: "Format/PNG"
+
+  - match:
+      extension: [".webp"]
+    actions:
+      tag: "Format/WEBP"
+
+  - match:
+      extension: [".webm"]
+    actions:
+      tag: "Format/WEBM"
+
+  - match:
+      extension: [".psd"]
+    actions:
+      tag: "Format/PSD"
+
+  # Source (folder name in the original path; check folder names on the server)
+  - match:
+      path_like: ["/Twitter/", "/TweetDownloader/"]
+    actions:
+      tag: "Source/Twitter"
+
+  - match:
+      path_like: ["/Reddit/"]
+    actions:
+      tag: "Source/Reddit"
+
+  - match:
+      path_like: ["/pixiv/"]
+    actions:
+      tag: "Source/pixiv"
+
+  - match:
+      path_like: ["/Fanbox/", "/Fanbox Downloads/"]
+    actions:
+      tag: "Source/Fanbox"
+
+  - match:
+      path_like: ["/Bluesky/"]
+    actions:
+      tag: "Source/Bluesky"
+
+  - match:
+      path_like: ["/Tumblr/"]
+    actions:
+      tag: "Source/Tumblr"
+
+  - match:
+      path_like: ["/Imgur/"]
+    actions:
+      tag: "Source/Imgur"
+
+  - match:
+      path_like: ["/MEGA/", "/MEGA Downloads/"]
+    actions:
+      tag: "Source/MEGA"
+
+  - match:
+      path_like: ["/9GAG/"]
+    actions:
+      tag: "Source/9GAG"
+
+  - match:
+      path_like: ["/TikTok/"]
+    actions:
+      tag: "Source/TikTok"
+
+  - match:
+      path_like: ["/Instagram/"]
+    actions:
+      tag: "Source/Instagram"
+
+  - match:
+      path_like: ["/Snapchat/"]
+    actions:
+      tag: "Source/Snapchat"
+
+  - match:
+      path_like: ["/WhatsApp/"]
+    actions:
+      tag: "Source/WhatsApp"
+
+  - match:
+      path_like: ["/Telegram/"]
+    actions:
+      tag: "Source/Telegram"
+
+  - match:
+      path_like: ["/Discord/"]
+    actions:
+      tag: "Source/Discord"
+
+  - match:
+      path_like: ["/ChatGPT/"]
+    actions:
+      tag: "Source/ChatGPT"
+
+  - match:
+      path_like: ["/Kleinanzeigen/"]
+    actions:
+      tag: "Source/Kleinanzeigen"
+
+  # Kind (check folder names on the server)
+  - match:
+      path_like: ["/Camera/", "/DCIM/"]
+    actions:
+      tag: "Kind/Camera"
+
+  - match:
+      path_like: ["/Screenshots/"]
+    actions:
+      tag: "Kind/Screenshot"
+
+  - match:
+      name_like: ["Screenshot"]
+    actions:
+      tag: "Kind/Screenshot"
+
+  - match:
+      path_like: ["/Screen recordings/", "/ScreenRecorder/", "/Screen Recordings/"]
+    actions:
+      tag: "Kind/Screen recording"
+
+  - match:
+      name_like: ["Screen recording", "Screen_Recording", "ScreenRecording"]
+    actions:
+      tag: "Kind/Screen recording"
+
+  - match:
+      path_like: ["/Adobe Scan/"]
+    actions:
+      tag: "Kind/Scan"
+
+  - match:
+      name_like: ["CanoScan"]
+    actions:
+      tag: "Kind/Scan"
+
+  # Size, resolution, length
+  - match:
+      min_size_mb: 100
+    actions:
+      tag: "Size/Over 100MB"
+
+  - match:
+      min_long_side: 3840
+    actions:
+      tag: "Resolution/4K"
+
+  - match:
+      type: VIDEO
+      min_duration_s: 600
+    actions:
+      tag: "Length/Over 10 min"
+
+  - match:
+      type: VIDEO
+      max_duration_s: 10
+    actions:
+      tag: "Length/Under 10 sec"
+
+  # Examples of the other actions (uncomment to use)
+  # - match:
+  #     path_like: ["/Pictures/"]
+  #   actions:
+  #     folder_tag: {strip_prefix: "/mnt/IMMICH-DATA-UPLOAD/Pictures/", levels: 2}   # .../Pictures/Comics/Artist/x.jpg -> tag Comics/Artist
+  # - match:
+  #     path_like: ["/Twitter/"]
+  #   actions:
+  #     album: "Twitter"           # created if missing
+  #     visibility: archive        # archive, hidden or timeline

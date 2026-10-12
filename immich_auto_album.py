@@ -42,7 +42,12 @@ from immichpy.client.generated import (
     CreateAlbumDto,
     LibraryResponseDto,
     MetadataSearchDto,
+    QueueResponseDto,
     SearchResponseDto,
+    TagBulkAssetsDto,
+    TagResponseDto,
+    TagUpsertDto,
+    UserAdminResponseDto,
     ServerVersionResponseDto,
     UpdateAlbumDto,
     UpdateAlbumUserDto,
@@ -57,6 +62,7 @@ from tenacity import (
     wait_exponential,
     AsyncRetrying,
 )
+from organizer import Organizer
 
 # Script Constants
 # Environment variable to check if the script is running inside Docker
@@ -81,6 +87,8 @@ class ApiClientConfig:
     max_retry_count: int
     # # Number of threads to fetch assets with in parallel
     threads: int
+    # Flag indicating whether to request EXIF data with assets (organizer rules need the file size)
+    with_exif: bool
 
     def __init__(self, main_config : Configuration) -> None:
         self.chunk_size = main_config.chunk_size
@@ -89,6 +97,7 @@ class ApiClientConfig:
         self.insecure = main_config.insecure
         self.max_retry_count = main_config.max_retry_count
         self.threads = main_config.threads
+        self.with_exif = bool(main_config.rules_file)
 
 # pylint: disable=R0902,R0904
 class ApiClient:
@@ -435,11 +444,11 @@ class ApiClient:
         :returns: An array of asset objects
         :rtype: list[AssetResponseDto]
         """
-        asset_list = self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=AssetVisibility.TIMELINE))
+        asset_list = self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=AssetVisibility.TIMELINE, with_exif=self.config.with_exif or None))
         for visiblity_option in visibility_options:
             # Do not fetch agin for 'timeline', that's the default!
             if visiblity_option != AssetVisibility.TIMELINE:
-                asset_list += self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=visiblity_option))
+                asset_list += self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=visiblity_option, with_exif=self.config.with_exif or None))
         return asset_list
 
     # pylint: disable=R0914
@@ -737,6 +746,94 @@ class ApiClient:
         :raises: Exception if the API call fails
         """
         self.__request_api(lambda c: c.assets.update_assets(asset_bulk_update_dto=AssetBulkUpdateDto(ids=asset_ids_for_visibility, visibility=visibility_setting)))
+
+    # Wrappers used by the organizer (organizer.py)
+
+    def rename_album(self, album_id_to_rename: UUID, new_album_name: str) -> None:
+        """
+        Renames an album in Immich.
+
+        :param album_id_to_rename: The ID of the album to rename
+        :param new_album_name: The new album name
+        :raises: Exception if the API call fails
+        """
+        self.__request_api(lambda c: c.albums.update_album_info(id=album_id_to_rename, update_album_dto=UpdateAlbumDto(albumName=new_album_name)))
+
+    def fetch_tags(self) -> list[TagResponseDto]:
+        """
+        Fetches all tags of the API key's user.
+
+        :returns: All tags
+        :rtype: list[TagResponseDto]
+        """
+        return self.__request_api(lambda c: c.tags.get_all_tags())
+
+    def upsert_tags(self, tag_paths: list[str]) -> list[TagResponseDto]:
+        """
+        Creates tags by path (e.g. `Source/Twitter`, parents are created too) and returns them. Existing tags are returned unchanged.
+
+        :param tag_paths: The tag paths to create
+        :returns: The created or existing tags
+        :rtype: list[TagResponseDto]
+        """
+        return self.__request_api(lambda c: c.tags.upsert_tags(TagUpsertDto(tags=tag_paths)))
+
+    def tag_assets(self, tag_id_to_set: UUID, asset_ids_to_tag: list[UUID]) -> None:
+        """
+        Adds one tag to the passed assets.
+
+        :param tag_id_to_set: The ID of the tag
+        :param asset_ids_to_tag: The IDs of the assets to tag
+        """
+        self.__request_api(lambda c: c.tags.bulk_tag_assets(TagBulkAssetsDto(tag_ids=[tag_id_to_set], asset_ids=asset_ids_to_tag)))
+
+    def untag_assets(self, tag_id_to_remove: UUID, asset_ids_to_untag: list[UUID]) -> None:
+        """
+        Removes one tag from the passed assets.
+
+        :param tag_id_to_remove: The ID of the tag
+        :param asset_ids_to_untag: The IDs of the assets to untag
+        """
+        self.__request_api(lambda c: c.tags.untag_assets(id=tag_id_to_remove, bulk_ids_dto=BulkIdsDto(ids=asset_ids_to_untag)))
+
+    def delete_tag(self, tag_id_to_delete: UUID) -> None:
+        """
+        Deletes a tag. Immich removes it from all assets that still carry it.
+
+        :param tag_id_to_delete: The ID of the tag
+        """
+        self.__request_api(lambda c: c.tags.delete_tag(id=tag_id_to_delete))
+
+    def fetch_asset_ids(self, **search_options: Any) -> set[UUID]:
+        """
+        Fetches the IDs of all assets matching the passed search options, e.g. tag_ids=[...] or album_ids=[...].
+        Assets in the locked folder are not included: searching them needs an elevated session an API key cannot get.
+
+        :returns: The asset IDs
+        :rtype: set[UUID]
+        """
+        asset_ids: set[UUID] = set()
+        for visibility_option in [AssetVisibility.TIMELINE, AssetVisibility.ARCHIVE, AssetVisibility.HIDDEN]:
+            asset_ids.update(asset.id for asset in self.fetch_assets_with_options(MetadataSearchDto(visibility=visibility_option, **search_options)))
+        return asset_ids
+
+    def fetch_queues(self) -> list[QueueResponseDto]:
+        """
+        Fetches the job queues with their statistics. Needs an admin API key.
+
+        :returns: All queues
+        :rtype: list[QueueResponseDto]
+        """
+        return self.__request_api(lambda c: c.queues.get_queues())
+
+    def fetch_my_user(self) -> UserAdminResponseDto:
+        """
+        Fetches the user the API key belongs to.
+
+        :returns: The user
+        :rtype: UserAdminResponseDto
+        """
+        return self.__request_api(lambda c: c.users.get_my_user())
 
     def delete_all_albums(self, assets_visibility: AssetVisibility | None, force_delete: bool):
         """
@@ -1221,7 +1318,8 @@ class Configuration():
         "comments_and_likes_disabled": False,
         "update_album_props_mode": 0,
         "max_retry_count": ApiClient.MAX_RETRY_COUNT_ON_TIMEOUT_DEFAULT,
-        "threads": ApiClient.THREADS_DEFAULT
+        "threads": ApiClient.THREADS_DEFAULT,
+        "rules_dry_run": False
     }
 
     # Static (Global) configuration options
@@ -1285,6 +1383,10 @@ class Configuration():
 
         self.update_album_props_mode = Utils.get_value_or_config_default("update_album_props_mode", args, Configuration.CONFIG_DEFAULTS["update_album_props_mode"])
         self.max_retry_count = Utils.get_value_or_config_default('max_retry_count', args, Configuration.CONFIG_DEFAULTS['max_retry_count'])
+        # Organizer settings (rule file), see organizer.py. Without a rule file the script behaves like upstream.
+        self.rules_file: Optional[str] = Utils.get_value_or_config_default('rules_file', args, None)
+        self.rules_dry_run: bool = Utils.get_value_or_config_default('rules_dry_run', args, Configuration.CONFIG_DEFAULTS['rules_dry_run'])
+        self.queue_api_key: Optional[str] = Utils.get_value_or_config_default('queue_api_key', args, None)
 
         if self.mode != Configuration.SCRIPT_MODE_CREATE:
             # Override unattended if we're running in destructive mode
@@ -1510,6 +1612,12 @@ class Configuration():
                             help="Number of times to retry an Immich API call if it timed out before failing.")
         parser.add_argument("--threads", type=int, default=Configuration.CONFIG_DEFAULTS['threads'], choices=range(1, ApiClient.THREADS_MAX+1),
                             help="Number of threads to fetch assets with in parallel.")
+        parser.add_argument("--rules-file", default=None,
+                            help="Path to a YAML rule file that tags assets, adds them to albums or sets their visibility (see README, section Organizer rules). Without it, nothing changes.")
+        parser.add_argument("--rules-dry-run", action="store_true",
+                            help="Only log what the rule file would change. Folder albums are still created as usual.")
+        parser.add_argument("--queue-api-key", default=None,
+                            help="Admin API key used to read the job queues between rule file batches. Defaults to the API key of the run.")
         return parser
 
     @staticmethod
@@ -2254,6 +2362,9 @@ class FolderAlbumCreator():
                 self.api_client.delete_all_albums(self.config.visibility, self.config.delete_confirm)
                 return
 
+            # Organizer hook: load the rule file first so a broken file stops the run before any write
+            organizer = Organizer(self.config, self.api_client) if self.config.rules_file else None
+
             albumprops_cache: Optional[dict[str, AlbumModel]] = None
             if self.config.read_album_properties:
                 logging.debug("Albumprops: Finding, parsing and loading %s files with inheritance support", FolderAlbumCreator.ALBUMPROPS_FILE_NAME)
@@ -2291,6 +2402,10 @@ class FolderAlbumCreator():
 
             albums = self.api_client.fetch_albums()
             logging.info("%d existing albums identified", len(albums))
+
+            # Organizer hook: repair broken album names before albums are looked up by name (not before a CLEANUP deletes them)
+            if organizer and self.config.mode == Configuration.SCRIPT_MODE_CREATE:
+                organizer.repair_album_names(albums, list(albums_to_create.values()))
 
             album: AlbumModel
             for album in albums_to_create.values():
@@ -2370,6 +2485,10 @@ class FolderAlbumCreator():
 
             logging.info("%d albums created", len(created_albums))
 
+            # Organizer hook: apply the rule file (tags, albums, visibility) with pacing
+            if organizer:
+                await organizer.run_rules(assets)
+
             # Perform album cover randomization
             if self.config.set_album_thumbnail == Configuration.ALBUM_THUMBNAIL_RANDOM_ALL:
                 logging.info("Picking a new random thumbnail for all albums")
@@ -2409,7 +2528,7 @@ class FolderAlbumCreator():
                 # pylint: disable=C0103
                 cleaned_album_count = 0
                 for a in albums:
-                    if a.asset_count == 0:
+                    if a.asset_count == 0 and not (organizer and organizer.keeps_empty_album(a.album_name)):
                         empty_album_count += 1
                         logging.info("Deleting empty album %s", a.album_name)
                         if self.api_client.delete_album(a.id):

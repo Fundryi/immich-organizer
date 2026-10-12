@@ -7,6 +7,8 @@
 
 # Immich Folder Album Creator
 
+> This is [Fundryi/immich-organizer](https://github.com/Fundryi/immich-organizer), a fork of [Salvoxia/immich-folder-album-creator](https://github.com/Salvoxia/immich-folder-album-creator). All album logic below is Salvoxia's work. The fork adds a rule file for tags, albums, visibility and name repair, see [Organizer rules](#organizer-rules-this-fork). Image: `ghcr.io/fundryi/immich-organizer`.
+
 This is a python script designed to automatically create albums in [Immich](https://immich.app/) from a folder structure mounted into the Immich container.
 This is useful for automatically creating and populating albums for external libraries.
 Using the provided docker image, the script can simply be added to the Immich compose stack and run along the rest of Immich's containers.
@@ -38,6 +40,7 @@ This script is originally based on the following original script: [REDVM/immich_
       - [Container Start Behavior](#container-start-behavior)
     - [Choosing the correct `root_path`](#choosing-the-correct-root_path)
   - [How it works](#how-it-works)
+  * [Organizer rules (this fork)](#organizer-rules-this-fork)
   - [Album Level Ranges](#album-level-ranges)
   - [Filtering](#filtering)
     - [Ignoring Assets](#ignoring-assets)
@@ -91,8 +94,9 @@ The list contains API key permissions valid for **Immich v3.0.0**.
 ### Bare Python Script
 1. Download the script and its requirements
     ```bash
-    curl https://raw.githubusercontent.com/Salvoxia/immich-folder-album-creator/main/immich_auto_album.py -o immich_auto_album.py
-    curl https://raw.githubusercontent.com/Salvoxia/immich-folder-album-creator/main/requirements.txt -o requirements.txt
+    curl https://raw.githubusercontent.com/Fundryi/immich-organizer/main/immich_auto_album.py -o immich_auto_album.py
+    curl https://raw.githubusercontent.com/Fundryi/immich-organizer/main/organizer.py -o organizer.py
+    curl https://raw.githubusercontent.com/Fundryi/immich-organizer/main/requirements.txt -o requirements.txt
     ```
 2. Install requirements (ensure the `immichpy` version in `requirements.txt` matches your Immich server version—see [immichpy COMPATIBILITY.csv](https://github.com/timonrieger/immichpy/blob/main/COMPATIBILITY.csv))
     ```bash
@@ -103,7 +107,7 @@ The list contains API key permissions valid for **Immich v3.0.0**.
     usage: immich_auto_album.py [-h] [--api-key API_KEY] [-t {literal,file}] [-r ROOT_PATH] [-u] [-a ALBUM_LEVELS] [-s ALBUM_SEPARATOR] [-R PATTERN [REPL ...]] [-c CHUNK_SIZE] [-C FETCH_CHUNK_SIZE] [-l {CRITICAL,ERROR,WARNING,INFO,DEBUG}] [-k] [-i IGNORE] [--ignore-regex IGNORE_REGEX]
                             [-m {CREATE,CLEANUP,DELETE_ALL}] [-d] [-x SHARE_WITH] [-o {AlbumUserRole.EDITOR,AlbumUserRole.VIEWER}] [-S {0,1,2}] [-O {False,asc,desc}] [-A] [-f PATH_FILTER] [--path-filter-regex PATH_FILTER_REGEX] [--set-album-thumbnail {first,last,random,random-all,random-filtered}]
                             [--visibility {archive,locked,timeline}] [--find-archived-assets] [--read-album-properties] [--api-timeout API_TIMEOUT] [--comments-and-likes-enabled] [--comments-and-likes-disabled] [--update-album-props-mode {0,1,2}] [--max-retry-count MAX_RETRY_COUNT]
-                            [--threads {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}]
+                            [--threads {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}] [--rules-file RULES_FILE] [--rules-dry-run] [--queue-api-key QUEUE_API_KEY]
                             root_path api_url api_key
 
     Create Immich Albums from an external library path based on the top level folders
@@ -264,6 +268,9 @@ The environment variables are analogous to the script's command line arguments.
 | `ALBUM_NAME_POST_REGEX1..10` | no         | `-`              | Up to 10 numbered environment variables `ALBUM_NAME_POST_REGEX1` to `ALBUM_NAME_POST_REGEX10` for album name post processing with regular expressions.<br> Refer to [Album Name Regex](#album-name-regex) |
 | `MAX_RETRY_COUNT`            | no         | `3`              | Maximum number of times an API call is retried if it timed out before failing.|
 | `THREADS`                    | no         | `4`              | Number of threads to fetch assets with in parallel.<br>Range: `[1..20]`|
+| `RULES_FILE`                 | no         | `-`              | Path to the YAML rule file inside the container, see [Organizer rules](#organizer-rules-this-fork). Without it the script behaves like upstream. |
+| `RULES_DRY_RUN`              | no         | `0`              | Set to `1` to only log what the rule file would change. Folder albums are still created. |
+| `QUEUE_API_KEY`              | no         | `-`              | Admin API key used to read the job queues between rule file batches. Defaults to `API_KEY`. |
 
 #### Run the container with Docker
 
@@ -495,6 +502,43 @@ Albums created for `root_path = /external_libs/photos/Birthdays`:
 > Note that with negative `album-levels` or album level ranges, images from different parent folders will be mixed in the same album if they reside in sub-folders with the same name (see `Vacation` in example above).
 
 Since Immich does not support real nested albums ([yet?](https://github.com/immich-app/immich/discussions/2073)), neither does this script.
+
+## Organizer rules (this fork)
+
+This fork adds one YAML rule file that tags assets, adds them to albums and sets their visibility. It also repairs album and tag names that were damaged by a wrong character set, and keeps chosen empty albums alive. Without `--rules-file` (or `RULES_FILE`) the script does exactly what the upstream script does.
+
+Start from [`rules.example.yaml`](rules.example.yaml). A rule has a `match` part and an `actions` part. All keys inside `match` must match (AND). A list value matches when one entry matches (OR). A rule without `match` matches every asset.
+
+```yaml
+keep_empty_albums: [Screenshots]      # SYNC_MODE never deletes these albums when they are empty
+repair_names: true                    # fix Shift_JIS names that were read as Windows-1252, in Immich only
+rename_tags: {}                       # old tag path -> new tag path, for names the automatic fix cannot repair
+rename_albums: {}                     # old album name -> new album name
+rules:
+  - match:
+      path_like: ["/Twitter/"]        # case-insensitive substring of the whole asset path, file name included: wrap folder names in slashes
+      name_like: ["Screenshot"]       # case-insensitive substring of the file name
+      extension: [".gif"]
+      type: VIDEO                     # IMAGE or VIDEO
+      min_size_mb: 100
+      min_long_side: 3840             # the longer side in pixels
+      min_duration_s: 600
+      max_duration_s: 10
+      account: alice                  # name or email of the user the API key belongs to
+    actions:
+      tag: "Source/Twitter"           # one tag or a list, a path creates the parent tag
+      folder_tag: {strip_prefix: "/mnt/pictures/", levels: 2}   # /mnt/pictures/Comics/Artist/x.jpg gets the tag Comics/Artist
+      album: "Twitter"
+      visibility: archive             # archive, hidden or timeline
+```
+
+How a run works:
+
+1. The rules see every asset the script fetched, across the whole library of the API key's user. `ROOT_PATH`, `PATH_FILTER` and `IGNORE` only limit the folder albums, not the rules. To test on a small set, write a rule with a narrow `path_like`. Set `FIND_ASSETS_IN_ALBUMS=1` and `FIND_ARCHIVED_ASSETS=true`, or the rules see only part of the library. Hidden and locked assets are never seen, so a `hidden` visibility cannot be undone by a rule.
+2. The script skips what is already done: assets that carry the tag, are in the album, or already have that visibility. A normal run only touches new uploads.
+3. `--rules-dry-run` (`RULES_DRY_RUN=1`) logs the plan and writes nothing. Folder albums are still created as usual. Use it before the first real run.
+4. Writes go in batches of 50 assets. After every batch the script waits until the Immich job queues `sidecar`, `metadataExtraction` and `storageTemplateMigration` are idle, because every tag write makes Immich write a sidecar file and re-read the file's metadata. A whole library at once can run the server out of memory. Reading the queues needs an admin API key: pass it as `--queue-api-key` (`QUEUE_API_KEY`) when the run's key is not an admin key. If the queues cannot be read, nothing is written.
+5. The script never renames, merges or deletes tags or albums outside name repair. Album repair only touches folder albums of this run. Tag repair touches tags listed in `rename_tags` or detected as damaged. Tags cannot be renamed through the Immich API, so a tag repair creates the new tag, copies the assets over in paced batches, removes the old tag from them and deletes the old tag only when it is empty. If the fixed tag already exists, the assets are merged into it. Files and folders on disk are never touched.
 
 ## Filtering
 

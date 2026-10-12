@@ -256,5 +256,17 @@ if [ ! -z "$THREADS" ]; then
     args="--threads $THREADS $args"
 fi
 
+if [ ! -z "$RULES_FILE" ]; then
+    args="--rules-file \"$RULES_FILE\" $args"
+fi
+
+if is_env_var_true "RULES_DRY_RUN"; then
+    args="--rules-dry-run $args"
+fi
+
+if [ ! -z "$QUEUE_API_KEY" ]; then
+    args="--queue-api-key \"$QUEUE_API_KEY\" $args"
+fi
+
 BASEDIR=$(dirname "$0")
 echo $args | xargs python3 -u $BASEDIR/immich_auto_album.py

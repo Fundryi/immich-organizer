@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+# Pre-commit guard: refuse staged lines that look like a secret or an AI co-author trailer.
+# Enable once per clone with:  git config core.hooksPath .githooks
+# Private names and addresses to block go into .git/privacy-patterns (one grep -E pattern per line, never committed).
+pattern='Co-Authored-B[y]|/mnt/TAN[K]|(api[_-]?key|token|secret|password)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_-]{20,}'
+if [ -f "$(git rev-parse --git-dir)/privacy-patterns" ]; then
+    extra=$(grep -v '^[[:space:]]*$' "$(git rev-parse --git-dir)/privacy-patterns" | paste -sd '|' -)
+    [ -n "$extra" ] && pattern="$pattern|$extra"
+fi
+hits=$(git diff --cached --diff-filter=ACM -U0 | grep -E '^\+' | grep -v '^+++' | grep -E -i "$pattern")
+if [ -n "$hits" ]; then
+    echo "pre-commit: staged lines look like private data or a secret:" >&2
+    echo "$hits" | cut -c1-160 >&2
+    exit 1
+fi
