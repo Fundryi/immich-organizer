@@ -13,3 +13,6 @@ PLAN.md
 .local/
 __pycache__/
 .pytest_cache/
+
+# local deploy configs with the production key, never pushed
+deploy/
