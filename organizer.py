@@ -12,8 +12,11 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Callable
 
+import regex
 import yaml
 from immichpy.client.generated import AssetVisibility
 
@@ -25,9 +28,11 @@ TOP_LEVEL_KEYS = {"keep_empty_albums", "repair_names", "rename_tags", "rename_al
 TEXT_MATCH_KEYS = {"path_like", "path_not_like", "name_like", "name_regex", "extension", "type", "account", "make_like", "model_like"}
 NUMBER_MATCH_KEYS = {"min_size_mb", "max_size_mb", "min_long_side", "max_long_side", "min_duration_s", "max_duration_s"}
 TAG_GROUP = re.compile(r"\{(\d)\}")
-ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility"}
-FOLDER_ACTIONS = ("folder_tag", "folder_album")
+ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility", "order_by_name"}
+FOLDER_SPEC_KEYS = {"folder_tag": {"prefix"}, "folder_album": {"prefix", "order"}, "order_by_name": set()}
 ALBUM_SEPARATOR = " / "
+ALBUM_ORDERS = {"asc", "desc"}
+DIGITS = re.compile(r"(\d+)")
 VISIBILITIES = {"archive", "hidden", "timeline"}
 ASSET_TYPES = {"IMAGE", "VIDEO"}
 CJK_CHARS = re.compile("[぀-ヿ一-鿿！-｠]")
@@ -130,9 +135,9 @@ def _check_rule(where: str, rule: Any) -> dict[str, Any]:
         _fail(f"{where}.actions.album", "must be a non-empty string")
     if "visibility" in actions and actions["visibility"] not in VISIBILITIES:
         _fail(f"{where}.actions.visibility", f"must be one of {', '.join(sorted(VISIBILITIES))}")
-    for key in FOLDER_ACTIONS:
+    for key, extra in FOLDER_SPEC_KEYS.items():
         if key in actions:
-            actions = {**actions, key: _check_folder_spec(f"{where}.actions.{key}", actions[key])}
+            actions = {**actions, key: _check_folder_spec(f"{where}.actions.{key}", actions[key], extra)}
     return {"match": match, "actions": actions, "captures": captures}
 
 
@@ -143,8 +148,8 @@ def _compile(where: str, pattern: str) -> re.Pattern[str]:
         raise ValueError(f"Rule file, {where}: bad regex '{pattern}': {e}") from e
 
 
-def _check_folder_spec(where: str, spec: Any) -> dict[str, Any]:
-    _check_keys(where, spec, {"strip_prefix", "levels", "prefix"})
+def _check_folder_spec(where: str, spec: Any, extra: set[str]) -> dict[str, Any]:
+    _check_keys(where, spec, {"strip_prefix", "levels"} | extra)
     levels = spec.get("levels")
     if not isinstance(spec.get("strip_prefix"), str) or isinstance(levels, bool) or not isinstance(levels, int) or levels < 1:
         _fail(where, "needs strip_prefix (string) and levels (whole number from 1)")
@@ -153,6 +158,8 @@ def _check_folder_spec(where: str, spec: Any) -> dict[str, Any]:
         _fail(f"{where}.strip_prefix", "must end with '/'")
     if not isinstance(spec.get("prefix", ""), str):
         _fail(f"{where}.prefix", "must be a string")
+    if "order" in spec and spec["order"] not in ALBUM_ORDERS:
+        _fail(f"{where}.order", "must be asc or desc")
     return {"prefix": "", **spec}
 
 
@@ -293,29 +300,78 @@ def _first_by_name(albums: list[Any]) -> dict[str, Any]:
     return by_name
 
 
-def _drop_unsafe_albums(album_plan: dict[str, set[Any]], raw_names: dict[str, str], fetched: list[Any]) -> dict[str, Any]:
+@dataclass
+class Plan:
+    """What one run has to write: asset ids per tag, album and visibility, album orders, dates per asset id."""
+    tags: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
+    albums: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
+    visibility: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
+    raw_album_names: dict[str, str] = field(default_factory=dict)
+    album_orders: dict[str, str] = field(default_factory=dict)
+    groups: dict[str, dict[Any, Any]] = field(default_factory=lambda: defaultdict(dict))
+    dates: dict[Any, str] = field(default_factory=dict)
+
+
+def natural_key(name: str) -> list[Any]:
+    """Sort key that reads the numbers in a file name as numbers: 2.png before 10.png, 05319a before 05319b."""
+    # re.split with a group alternates text and digits, text first, so each position has one type across names.
+    return [int(part) if index % 2 else part.lower() for index, part in enumerate(DIGITS.split(name))]
+
+
+def plan_dates(groups: dict[str, dict[Any, Any]]) -> dict[Any, str]:
+    """
+    Dates that put every group of assets in file name order: the group's earliest date plus one second per
+    position. A group whose dates already rise in name order needs nothing; a group with a file name that does
+    not start with a number is skipped.
+    """
+    dates = {}
+    for group, by_id in sorted(groups.items()):
+        assets = list(by_id.values())
+        if not all((asset.original_file_name or "")[:1].isdigit() for asset in assets):
+            logging.warning("Rules: order '%s' skipped, not every file name starts with a number", group)
+            continue
+        # Date and id break ties between equal names (a page copied into a variant folder), so reruns stay stable.
+        assets = sorted(assets, key=lambda a: (natural_key(a.original_file_name), a.file_created_at, str(a.id)))
+        stamps = [asset.file_created_at for asset in assets]
+        if all(earlier < later for earlier, later in zip(stamps, stamps[1:])):
+            continue
+        changes = {}
+        for index, asset in enumerate(assets):
+            target = min(stamps) + timedelta(seconds=index)
+            if asset.file_created_at != target:
+                changes[asset.id] = target.isoformat()
+        dates.update(changes)
+        logging.info("Rules: order '%s': %d dates to set", group, len(changes))
+    return dates
+
+
+def _drop_unsafe_albums(plan: Plan, fetched: list[Any]) -> dict[str, Any]:
     """Drops planned albums whose name is taken twice or whose broken name still exists, and returns the albums by name."""
     counts = Counter(nfc(album.album_name) for album in fetched)
     albums = _first_by_name(fetched)
-    for name in list(album_plan):
+    for name in sorted(set(plan.albums) | set(plan.album_orders)):
         if counts[name] > 1:
             logging.warning("Rules: %d albums are named '%s', skipping it (no merge)", counts[name], name)
-        elif raw_names.get(name) in albums:
-            logging.warning("Rules: album '%s' still exists, rename it first; skipping '%s'", raw_names[name], name)
+        elif plan.raw_album_names.get(name) in albums:
+            logging.warning("Rules: album '%s' still exists, rename it first; skipping '%s'", plan.raw_album_names[name], name)
         else:
             continue
-        del album_plan[name]
+        plan.albums.pop(name, None)
+        plan.album_orders.pop(name, None)
     return albums
 
 
-def _log_plan(repairs: list[tuple[Any, str]], tag_plan: dict[str, set[Any]], album_plan: dict[str, set[Any]], visibility_plan: dict[str, set[Any]]) -> tuple[int, ...]:
+def _log_plan(repairs: list[tuple[Any, str]], plan: Plan) -> tuple[int, ...]:
     for tag, fixed in repairs:
         logging.info("Rules: rename tag '%s' to '%s'", tag.value, fixed)
-    for label, plan in (("tag", tag_plan), ("album", album_plan), ("visibility", visibility_plan)):
-        for name, ids in sorted(plan.items()):
+    for label, items in (("tag", plan.tags), ("album", plan.albums), ("visibility", plan.visibility)):
+        for name, ids in sorted(items.items()):
             logging.info("Rules: %s '%s': %d assets to change", label, name, len(ids))
-    totals = (len(repairs), *(sum(len(ids) for ids in plan.values()) for plan in (tag_plan, album_plan, visibility_plan)))
-    logging.info("Rules plan: %d tag renames, %d tag assignments, %d album additions, %d visibility changes", *totals)
+    for name, order in sorted(plan.album_orders.items()):
+        logging.info("Rules: album '%s': order to set to %s", name, order)
+    totals = (len(repairs), *(sum(len(ids) for ids in items.values()) for items in (plan.tags, plan.albums, plan.visibility)),
+              len(plan.album_orders), len(plan.dates))
+    logging.info("Rules plan: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes", *totals)
     return totals
 
 
@@ -397,13 +453,13 @@ class Organizer:
         if not (self.config.find_assets_in_albums and self.config.find_archived_assets):
             logging.warning("Rules see only part of the library: turn on FIND_ASSETS_IN_ALBUMS and FIND_ARCHIVED_ASSETS to cover assets in albums and archived assets")
         tags = {nfc(tag.value): tag for tag in self.api_client.fetch_tags()}
-        tag_plan, album_plan, visibility_plan, raw_album_names = self._plan(assets)
+        plan = self._plan(assets)
         repairs = self._plan_tag_repairs(list(tags.values()))
         # Checked before the skip: else a rule whose assets all carry the broken tag re-tags them after every repair.
-        conflicts = sorted(tag.value for tag, _ in repairs if nfc(tag.value) in tag_plan)
-        albums = _drop_unsafe_albums(album_plan, raw_album_names, self.api_client.fetch_albums()) if album_plan else {}
-        tag_plan, album_plan = self._skip_done(tag_plan, album_plan, tags, albums)
-        totals = _log_plan(repairs, tag_plan, album_plan, visibility_plan)
+        conflicts = sorted(tag.value for tag, _ in repairs if nfc(tag.value) in plan.tags)
+        albums = _drop_unsafe_albums(plan, self.api_client.fetch_albums()) if plan.albums or plan.album_orders else {}
+        self._skip_done(plan, tags, albums)
+        totals = _log_plan(repairs, plan)
         if conflicts:
             logging.error("Rules both assign and repair the tags %s, rules write nothing. Fix the rule file.", ", ".join(conflicts))
             return
@@ -427,10 +483,11 @@ class Organizer:
             self._wait_idle(queue_client)
             for tag, fixed in repairs:
                 self._rename_tag(tag, fixed, queue_client)
-            self._write_tags(tag_plan, tags, queue_client)
-            self._write_albums(album_plan, albums, queue_client)
-            self._write_visibility(visibility_plan, queue_client)
-            logging.info("Rules applied: %d tag renames, %d tag assignments, %d album additions, %d visibility changes", *totals)
+            self._write_tags(plan.tags, tags, queue_client)
+            self._write_albums(plan, albums, queue_client)
+            self._write_visibility(plan.visibility, queue_client)
+            self._in_batches(set(plan.dates), lambda batch: [self.api_client.set_asset_date(i, plan.dates[i]) for i in batch], queue_client)
+            logging.info("Rules applied: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes", *totals)
         except RuntimeError as e:
             # A paused queue or a timeout stops the rules only; upstream's remaining steps and the next API key still run.
             logging.error("%s", e)
@@ -455,12 +512,9 @@ class Organizer:
         if queue_client is not self.api_client:
             await queue_client.__aexit__(None, None, None)
 
-    def _plan(self, assets: list[Any]) -> tuple[dict[str, set[Any]], dict[str, set[Any]], dict[str, set[Any]], dict[str, str]]:
+    def _plan(self, assets: list[Any]) -> Plan:
         me = self.api_client.fetch_my_user()
-        tag_plan: dict[str, set[Any]] = defaultdict(set)
-        album_plan: dict[str, set[Any]] = defaultdict(set)
-        visibility_plan: dict[str, set[Any]] = defaultdict(set)
-        raw_album_names: dict[str, str] = {}
+        plan = Plan()
         for asset in assets:
             visibilities = []
             for rule in self.rules["rules"]:
@@ -471,38 +525,59 @@ class Organizer:
                 if "folder_tag" in actions:
                     paths = paths + [folder_name_for(asset, actions["folder_tag"], repair=self.rules["repair_names"])]
                 for path in filter(None, paths):
-                    tag_plan[nfc(path)].add(asset.id)
+                    plan.tags[nfc(path)].add(asset.id)
                 names = [actions["album"]] if "album" in actions else []
                 if "folder_album" in actions:
-                    names.append(self._folder_album(asset, actions["folder_album"], raw_album_names))
+                    names.append(self._folder_album(asset, actions["folder_album"], plan))
                 for name in filter(None, names):
-                    album_plan[nfc(name)].add(asset.id)
+                    plan.albums[nfc(name)].add(asset.id)
+                if "order_by_name" in actions and (group := folder_name_for(asset, actions["order_by_name"])):
+                    # Keyed by the full folder path, and by asset id, so two rules cannot merge or double a group.
+                    plan.groups[actions["order_by_name"]["strip_prefix"] + group][asset.id] = asset
                 if "visibility" in actions:
                     visibilities.append(actions["visibility"])
             if len(set(visibilities)) > 1:
                 logging.warning("Rules give %s more than one visibility, the last matching rule wins", asset.original_path)
             if visibilities and asset.visibility.value != visibilities[-1]:
-                visibility_plan[visibilities[-1]].add(asset.id)
-        for path in sorted(tag_plan):
-            logging.info("Rules: tag '%s' matches %d assets", path, len(tag_plan[path]))
-        return tag_plan, album_plan, visibility_plan, raw_album_names
+                plan.visibility[visibilities[-1]].add(asset.id)
+        for path in sorted(plan.tags):
+            logging.info("Rules: tag '%s' matches %d assets", path, len(plan.tags[path]))
+        plan.dates = plan_dates(plan.groups)
+        return plan
 
-    def _folder_album(self, asset: Any, spec: dict[str, Any], raw_names: dict[str, str]) -> str | None:
+    def _folder_album(self, asset: Any, spec: dict[str, Any], plan: Plan) -> str | None:
         # Repaired, else a broken folder name creates the broken album again on every run.
-        name = folder_name_for(asset, spec, ALBUM_SEPARATOR, self.rules["repair_names"])
-        raw = folder_name_for(asset, spec, ALBUM_SEPARATOR)
+        name = self._post_regex(folder_name_for(asset, spec, ALBUM_SEPARATOR, self.rules["repair_names"]))
+        raw = self._post_regex(folder_name_for(asset, spec, ALBUM_SEPARATOR))
         if name and raw and name != raw:
-            raw_names[nfc(name)] = nfc(raw)
+            plan.raw_album_names[nfc(name)] = nfc(raw)
+        if name and "order" in spec:
+            plan.album_orders[nfc(name)] = spec["order"]
         return name
 
-    def _skip_done(self, tag_plan: dict[str, set[Any]], album_plan: dict[str, set[Any]], tags: dict[str, Any], albums: dict[str, Any]) -> tuple[dict[str, set[Any]], dict[str, set[Any]]]:
-        for path, ids in tag_plan.items():
+    def _post_regex(self, name: str | None) -> str | None:
+        # The same ALBUM_NAME_POST_REGEX as upstream, so a folder album and the upstream album of one folder share a name.
+        for pattern, *repl in getattr(self.config, "album_name_post_regex", None) or []:
+            if name:
+                name = regex.sub(pattern, repl[0] if repl else "", name)
+        return name.strip() if name else name
+
+    def _skip_done(self, plan: Plan, tags: dict[str, Any], albums: dict[str, Any]) -> None:
+        for path, ids in plan.tags.items():
             if path in tags:
                 ids -= self.api_client.fetch_asset_ids(tag_ids=[tags[path].id])
-        for name, ids in album_plan.items():
+        for name, ids in plan.albums.items():
             if name in albums:
                 ids -= self.api_client.fetch_asset_ids(album_ids=[albums[name].id])
-        return {path: ids for path, ids in tag_plan.items() if ids}, {name: ids for name, ids in album_plan.items() if ids}
+        plan.tags = {path: ids for path, ids in plan.tags.items() if ids}
+        plan.albums = {name: ids for name, ids in plan.albums.items() if ids}
+        def order_needed(name: str, order: str) -> bool:
+            # An existing album with another order, or an album this run creates.
+            if name in albums:
+                return getattr(albums[name].order, "value", None) != order
+            return name in plan.albums
+
+        plan.album_orders = {name: order for name, order in plan.album_orders.items() if order_needed(name, order)}
 
     def _plan_tag_repairs(self, tags: list[Any]) -> list[tuple[Any, str]]:
         if not self.rules["repair_names"] and not self.rules["rename_tags"]:
@@ -547,14 +622,16 @@ class Organizer:
             tag_id = tags[path].id
             self._in_batches(ids, lambda batch, tag_id=tag_id: self.api_client.tag_assets(tag_id, batch), queue_client)
 
-    def _write_albums(self, album_plan: dict[str, set[Any]], albums: dict[str, Any], queue_client: Any) -> None:
-        for name, ids in album_plan.items():
-            if name in albums:
-                album_id = albums[name].id
-            else:
-                album_id = self.api_client.create_album(name)
+    def _write_albums(self, plan: Plan, albums: dict[str, Any], queue_client: Any) -> None:
+        ids_by_name = {name: album.id for name, album in albums.items()}
+        for name, ids in plan.albums.items():
+            if name not in ids_by_name:
+                ids_by_name[name] = self.api_client.create_album(name)
                 logging.info("Rules: album '%s' created", name)
-            self._in_batches(ids, lambda batch, album_id=album_id: self.api_client.add_assets_to_album(album_id, batch), queue_client)
+            self._in_batches(ids, lambda batch, album_id=ids_by_name[name]: self.api_client.add_assets_to_album(album_id, batch), queue_client)
+        for name, order in plan.album_orders.items():
+            self.api_client.set_album_order(ids_by_name[name], order)
+            logging.info("Rules: album '%s' order set to %s", name, order)
 
     def _write_visibility(self, visibility_plan: dict[str, set[Any]], queue_client: Any) -> None:
         for value, ids in visibility_plan.items():

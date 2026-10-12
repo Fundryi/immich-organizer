@@ -536,11 +536,14 @@ rules:
       tag: ["Source/Twitter", "Artist/{1}"]   # one tag or a list, a path creates the parent tag; {1} to {9} insert the groups of the first matching name_regex
       folder_tag: {strip_prefix: "/mnt/pictures/", levels: 2, prefix: "Folder/"}   # /mnt/pictures/Comics/Artist/x.jpg gets the tag Folder/Comics/Artist
       album: "Twitter"
-      folder_album: {strip_prefix: "/mnt/pictures/Trips/", levels: 1, prefix: "Trips / "}   # one album per trip folder
+      folder_album: {strip_prefix: "/mnt/pictures/Trips/", levels: 1, prefix: "Trips / ", order: asc}   # one album per trip folder, oldest first
+      order_by_name: {strip_prefix: "/mnt/pictures/Comics/", levels: 1}   # pages of one comic folder get dates in file name order
       visibility: archive             # archive, hidden or timeline
 ```
 
-`folder_tag` and `folder_album` take the first `levels` folders after `strip_prefix` (which must end with `/`, never the file name) and join them with `/` for a tag or with ` / ` for an album; `prefix` goes in front. Fewer folders than `levels` means no tag or album for that asset.
+`folder_tag` and `folder_album` take the first `levels` folders after `strip_prefix` (which must end with `/`, never the file name) and join them with `/` for a tag or with ` / ` for an album; `prefix` goes in front. Fewer folders than `levels` means no tag or album for that asset. Folder album names go through the same `ALBUM_NAME_POST_REGEX` as upstream's albums. `order` (`asc` or `desc`) sets the sort order of the album, also on an album that already exists with the other order. With `UPDATE_ALBUM_PROPS_MODE=1` upstream resets the order of its own albums to `ALBUM_ORDER` on every run before the rules set it back, so use the rule order with mode `0`.
+
+`order_by_name` is for comics and other page sets: Immich sorts an album by date only, so the pages of a folder that were downloaded out of order show out of order. The action groups the assets by the first `levels` folders after `strip_prefix`, sorts each group by file name with numbers read as numbers (`2.png` before `10.png`), and sets the date taken to the group's earliest date plus one second per page. A group whose dates already rise in name order is left alone, and so is a group with a file name that does not start with a digit. Immich writes every changed date into an XMP sidecar file next to the original (`x.png.xmp`), which is the only file this tool ever causes to be written on disk.
 
 How a run works:
 

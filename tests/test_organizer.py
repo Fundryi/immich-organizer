@@ -3,22 +3,24 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 from uuid import uuid4
 
 import pytest
 
-from organizer import Organizer, fix_mojibake, folder_name_for, matches, parse_rule_file
+from organizer import Organizer, fix_mojibake, folder_name_for, matches, natural_key, parse_rule_file
 
+T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 BROKEN = "ŠÛ“Û˜b-ŽQ-"
 FIXED = "丸呑話-参-"
 ME = NS(name="alice", email="alice@example.com")
 QUEUE_NAMES = ["sidecar", "metadataExtraction", "storageTemplateMigration", "thumbnailGeneration"]
 
 
-def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline", camera=(None, None)):
+def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline", camera=(None, None), created=T0):
     return NS(id=uuid4(), original_path=path, original_file_name=path.rsplit("/", 1)[-1], type=NS(value=kind), visibility=NS(value=vis),
-              width=width, height=height, duration=duration, exif_info=NS(file_size_in_byte=size, make=camera[0], model=camera[1]))
+              width=width, height=height, duration=duration, file_created_at=created, exif_info=NS(file_size_in_byte=size, make=camera[0], model=camera[1]))
 
 
 class FakeApi:
@@ -48,8 +50,8 @@ class FakeApi:
         self.tag_members[tag.id] = set(members)
         return tag
 
-    def add_album(self, name, members=()):
-        album = NS(id=uuid4(), album_name=name, asset_count=len(members), owner=None)
+    def add_album(self, name, members=(), order="desc"):
+        album = NS(id=uuid4(), album_name=name, asset_count=len(members), owner=None, order=NS(value=order))
         self.albums.append(album)
         self.album_members[album.id] = set(members)
         return album
@@ -100,6 +102,12 @@ class FakeApi:
     def rename_album(self, album_id, name):
         self.calls.append(("rename_album", album_id, name))
 
+    def set_album_order(self, album_id, order):
+        self.calls.append(("set_album_order", album_id, order))
+
+    def set_asset_date(self, asset_id, date):
+        self.calls.append(("set_asset_date", asset_id, date))
+
     def fetch_queues(self):
         self.calls.append(("fetch_queues",))
         if self.queue_error:
@@ -143,10 +151,11 @@ def run(org, assets):
     asyncio.run(org.run_rules(assets))
 
 
-def make(tmp_path, text, api=None, dry_run=False, queue_api_key=None):
+def make(tmp_path, text, api=None, dry_run=False, queue_api_key=None, post_regex=None):
     rules_file = tmp_path / "rules.yaml"
     rules_file.write_text(text, encoding="utf-8")
-    config = NS(rules_file=str(rules_file), rules_dry_run=dry_run, queue_api_key=queue_api_key, find_assets_in_albums=True, find_archived_assets=True)
+    config = NS(rules_file=str(rules_file), rules_dry_run=dry_run, queue_api_key=queue_api_key, find_assets_in_albums=True, find_archived_assets=True,
+                album_name_post_regex=post_regex)
     org = Organizer(config, api or FakeApi())
     org.sleeps = []
     org.sleep = org.sleeps.append
@@ -189,6 +198,10 @@ def test_empty_rule_file_is_valid(tmp_path):
     ("rules:\n  - match: {extension: ''}\n    actions: {tag: x}\n", r"rules\[0\]\.match\.extension"),
     ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 1, sep: x}}\n", "unknown key 'sep'"),
     ("rules:\n  - actions: {folder_album: /p/}\n", "folder_album"),
+    ("rules:\n  - actions: {folder_album: {strip_prefix: /p/, levels: 1, order: up}}\n", r"folder_album\.order"),
+    ("rules:\n  - actions: {folder_tag: {strip_prefix: /p/, levels: 1, order: asc}}\n", "unknown key 'order'"),
+    ("rules:\n  - actions: {order_by_name: {strip_prefix: /p/, levels: 1, prefix: x}}\n", "unknown key 'prefix'"),
+    ("rules:\n  - actions: {order_by_name: true}\n", "order_by_name"),
 ])
 def test_rule_file_errors(tmp_path, text, message):
     with pytest.raises(ValueError, match=message):
@@ -664,7 +677,7 @@ def test_capture_group_tag(tmp_path):
     api = FakeApi()
     text = chr(10).join(["rules:", "  - match:", "      name_regex: ['" + r"^1\d{9}\.([a-z0-9~.-]+)_" + "']", "    actions:", "      tag: ['Source/Example', 'Artist/{1}']"])
     org = make(tmp_path, text, api=api, dry_run=True)
-    plan = org._plan([asset("/lib/1700000000.some-artist_title.jpg"), asset("/lib/1700000000._title.jpg"), asset("/lib/other.jpg")])[0]  # pylint: disable=protected-access
+    plan = org._plan([asset("/lib/1700000000.some-artist_title.jpg"), asset("/lib/1700000000._title.jpg"), asset("/lib/other.jpg")]).tags  # pylint: disable=protected-access
     assert len(plan["Artist/some-artist"]) == 1
     assert len(plan["Source/Example"]) == 1
     assert "Artist/" not in "".join(k for k in plan if k != "Artist/some-artist")
@@ -673,3 +686,79 @@ def test_capture_group_tag(tmp_path):
 def test_capture_tag_without_regex_is_rejected():
     with pytest.raises(ValueError, match="capture"):
         parse_rule_file({"rules": [{"match": {"path_like": ["/x/"]}, "actions": {"tag": "Artist/{1}"}}]})
+
+
+def test_natural_key_reads_numbers_as_numbers():
+    names = ["10.png", "2.png", "05319b.png", "05319a.png", "164 v3.jpg", "164 v10.jpg"]
+    assert sorted(names, key=natural_key) == ["2.png", "10.png", "164 v3.jpg", "164 v10.jpg", "05319a.png", "05319b.png"]
+
+
+def test_order_by_name_sets_dates_in_name_order(tmp_path, caplog):
+    api = FakeApi()
+    s = timedelta(seconds=1)
+    # 02 was saved before 01, and 03 sits in a variant subfolder of the same post
+    p1, p2 = asset("/mnt/G/Post/01a.png", created=T0 + 5 * s), asset("/mnt/G/Post/02a.png", created=T0)
+    p3 = asset("/mnt/G/Post/Internal/03b.png", created=T0 + 9 * s)
+    fine = [asset("/mnt/G/Fine/01.png", created=T0), asset("/mnt/G/Fine/02.png", created=T0 + s)]
+    mixed = [asset("/mnt/G/Mixed/02.png", created=T0), asset("/mnt/G/Mixed/cover.png", created=T0)]
+    text = "rules:\n  - actions: {order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n"
+    with caplog.at_level(logging.INFO):
+        run(make(tmp_path, text, api), [p1, p2, p3, *fine, *mixed])
+    dates = {c[1]: c[2] for c in api.calls if c[0] == "set_asset_date"}
+    assert dates == {p1.id: T0.isoformat(), p2.id: (T0 + s).isoformat(), p3.id: (T0 + 2 * s).isoformat()}
+    assert "order '/mnt/G/Mixed' skipped" in caplog.text
+    assert "3 date changes" in caplog.text
+
+
+def test_order_by_name_leaves_pages_already_on_their_date(tmp_path):
+    api = FakeApi()
+    s = timedelta(seconds=1)
+    p1, p2, p3 = asset("/mnt/G/P/1.png", created=T0), asset("/mnt/G/P/2.png", created=T0 + 3 * s), asset("/mnt/G/P/3.png", created=T0 + 2 * s)
+    run(make(tmp_path, "rules:\n  - actions: {order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n", api), [p1, p2, p3])
+    # Page 3 already sits on its target second, only page 2 moves
+    assert ("set_asset_date", p2.id, (T0 + s).isoformat()) in api.calls
+    assert api.writes() == ["set_asset_date"]
+
+
+def test_order_by_name_dry_run_writes_nothing(tmp_path):
+    api = FakeApi()
+    pages = [asset("/mnt/G/P/1.png", created=T0 + timedelta(seconds=1)), asset("/mnt/G/P/2.png", created=T0)]
+    run(make(tmp_path, "rules:\n  - actions: {order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n", api, dry_run=True), pages)
+    assert api.writes() == []
+
+
+def test_folder_album_order_is_set_on_new_and_existing_albums(tmp_path):
+    api = FakeApi()
+    a1, a2, a3 = asset("/mnt/P/A/1.jpg"), asset("/mnt/P/B/2.jpg"), asset("/mnt/P/C/3.jpg")
+    old = api.add_album("A", members={a1.id}, order="desc")
+    fine = api.add_album("C", members={a3.id}, order="asc")
+    text = "rules:\n  - actions: {folder_album: {strip_prefix: /mnt/P/, levels: 1, order: asc}}\n"
+    run(make(tmp_path, text, api), [a1, a2, a3])
+    created = next(a for a in api.albums if a.album_name == "B")
+    orders = [c for c in api.calls if c[0] == "set_album_order"]
+    assert sorted(orders, key=lambda c: str(c[1])) == sorted([("set_album_order", old.id, "asc"), ("set_album_order", created.id, "asc")], key=lambda c: str(c[1]))
+    assert fine.id not in [c[1] for c in orders]
+
+
+def test_folder_album_applies_the_upstream_post_regex(tmp_path):
+    api = FakeApi()
+    existing = api.add_album("Comics / Da ball   3")   # two underscores and a space
+    page = asset("/mnt/P/Comics/Da ball_ _3_/1.png")   # the trailing underscore becomes a space that upstream strips
+    text = "rules:\n  - actions: {folder_album: {strip_prefix: /mnt/P/, levels: 2}}\n"
+    run(make(tmp_path, text, api, post_regex=[["_", " "]]), [page])
+    assert api.writes() == ["add_assets_to_album"]
+    assert ("add_assets_to_album", existing.id, [page.id]) in api.calls
+
+
+def test_order_by_name_groups_do_not_double_or_merge_across_rules(tmp_path):
+    api = FakeApi()
+    s = timedelta(seconds=1)
+    comic = [asset("/mnt/C/Post/2.png", created=T0), asset("/mnt/C/Post/1.png", created=T0 + s)]
+    scan = asset("/mnt/S/Post/1.png", created=T0 + 5 * s)   # same relative folder name under another prefix
+    text = ("rules:\n"
+            "  - actions: {order_by_name: {strip_prefix: /mnt/C/, levels: 1}}\n"
+            "  - match: {extension: .png}\n    actions: {order_by_name: {strip_prefix: /mnt/C/, levels: 1}}\n"
+            "  - actions: {order_by_name: {strip_prefix: /mnt/S/, levels: 1}}\n")
+    run(make(tmp_path, text, api), [*comic, scan])
+    dates = {c[1]: c[2] for c in api.calls if c[0] == "set_asset_date"}
+    assert dates == {comic[1].id: T0.isoformat(), comic[0].id: (T0 + s).isoformat()}

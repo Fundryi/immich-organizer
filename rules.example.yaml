@@ -320,4 +320,10 @@ rules:
   #     path_like: ["/Screenshots/"]
   #   actions:
   #     album: "Screenshots"       # created if missing
+  # Comics: one album per comic folder, read oldest first, pages dated in file name order (Immich sorts albums by date only)
+  # - match:
+  #     path_like: ["/Comics/"]
+  #   actions:
+  #     folder_album: {strip_prefix: "/mnt/photos/Comics/", levels: 1, prefix: "Comics / ", order: asc}
+  #     order_by_name: {strip_prefix: "/mnt/photos/Comics/", levels: 1}   # pages in a variant subfolder join the same sequence
   #     visibility: archive        # archive, hidden or timeline

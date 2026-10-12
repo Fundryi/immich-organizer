@@ -51,6 +51,7 @@ from immichpy.client.generated import (
     ServerVersionResponseDto,
     UpdateAlbumDto,
     UpdateAlbumUserDto,
+    UpdateAssetDto,
     UserResponseDto,
 )
 from immichpy import AsyncClient
@@ -758,6 +759,26 @@ class ApiClient:
         :raises: Exception if the API call fails
         """
         self.__request_api(lambda c: c.albums.update_album_info(id=album_id_to_rename, update_album_dto=UpdateAlbumDto(albumName=new_album_name)))
+
+    def set_album_order(self, album_id_to_order: UUID, order: str) -> None:
+        """
+        Sets the asset order of an album.
+
+        :param album_id_to_order: The ID of the album
+        :param order: 'asc' or 'desc'
+        :raises: Exception if the API call fails
+        """
+        self.__request_api(lambda c: c.albums.update_album_info(id=album_id_to_order, update_album_dto=UpdateAlbumDto(order=AssetOrder(order))))
+
+    def set_asset_date(self, asset_id_to_date: UUID, date_time_original: str) -> None:
+        """
+        Sets the date taken of an asset. Immich writes it to the XMP sidecar and re-reads the metadata.
+
+        :param asset_id_to_date: The ID of the asset
+        :param date_time_original: ISO 8601 date and time with offset
+        :raises: Exception if the API call fails
+        """
+        self.__request_api(lambda c: c.assets.update_asset(id=asset_id_to_date, update_asset_dto=UpdateAssetDto(date_time_original=date_time_original)))
 
     def fetch_tags(self) -> list[TagResponseDto]:
         """
