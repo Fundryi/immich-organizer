@@ -7,7 +7,7 @@
 
 # Immich Folder Album Creator
 
-> This is [Fundryi/immich-organizer](https://github.com/Fundryi/immich-organizer), a fork of [Salvoxia/immich-folder-album-creator](https://github.com/Salvoxia/immich-folder-album-creator). All album logic below is Salvoxia's work. The fork adds a rule file for tags, albums, visibility and name repair, see [Organizer rules](#organizer-rules-this-fork). Image: `ghcr.io/fundryi/immich-organizer`.
+> This is [Fundryi/immich-organizer](https://github.com/Fundryi/immich-organizer), a fork of [Salvoxia/immich-folder-album-creator](https://github.com/Salvoxia/immich-folder-album-creator). All album logic below is Salvoxia's work. The fork adds a rule file for tags, albums, visibility and name repair, see [Organizer rules](#organizer-rules-this-fork). Image: `ghcr.io/fundryi/immich-organizer` (tag `edge`, built with `docker/build-image.sh` on the maintainer's machine, not by GitHub Actions; `linux/amd64` only unless you pass more platforms).
 
 This is a python script designed to automatically create albums in [Immich](https://immich.app/) from a folder structure mounted into the Immich container.
 This is useful for automatically creating and populating albums for external libraries.
