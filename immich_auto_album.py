@@ -26,7 +26,7 @@ import unicodedata
 import signal
 import regex
 import yaml
-from aiohttp import TCPConnector, ClientSession, ClientTimeout
+from aiohttp import TCPConnector, ClientConnectionError, ClientSession, ClientTimeout
 
 from immichpy.client.generated import (
     AddUsersDto,
@@ -332,7 +332,9 @@ class ApiClient:
         :returns: True if the exception is retryable, otherwise False
         :rtype: bool
         """
-        return isinstance(e, asyncio.TimeoutError) or (
+        # ClientConnectionError covers a keepalive connection the proxy or Immich closed mid-request
+        # (aiohttp ClientOSError "Broken pipe", ServerDisconnectedError); BrokenPipeError is the raw form.
+        return isinstance(e, (asyncio.TimeoutError, ClientConnectionError, BrokenPipeError, ConnectionResetError)) or (
             isinstance(e, ApiException) and e.status in {429, 500, 502, 503, 504}
         )
 
