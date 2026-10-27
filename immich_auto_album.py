@@ -63,6 +63,7 @@ from tenacity import (
     wait_exponential,
     AsyncRetrying,
 )
+import incremental
 from organizer import Organizer
 
 # Script Constants
@@ -72,7 +73,7 @@ ENV_IS_DOCKER = "IS_DOCKER"
 T = TypeVar("T")
 
 @dataclass
-class ApiClientConfig:
+class ApiClientConfig:  # pylint: disable=too-many-instance-attributes
     """
     Configuration for the API client
     """
@@ -90,6 +91,8 @@ class ApiClientConfig:
     threads: int
     # Flag indicating whether to request EXIF data with assets (organizer rules need the file size)
     with_exif: bool
+    # Only fetch assets updated after this time (incremental run), None fetches everything
+    updated_after: Optional[datetime.datetime]
 
     def __init__(self, main_config : Configuration) -> None:
         self.chunk_size = main_config.chunk_size
@@ -99,6 +102,7 @@ class ApiClientConfig:
         self.max_retry_count = main_config.max_retry_count
         self.threads = main_config.threads
         self.with_exif = bool(main_config.rules_file)
+        self.updated_after = None
 
 # pylint: disable=R0902,R0904
 class ApiClient:
@@ -447,12 +451,26 @@ class ApiClient:
         :returns: An array of asset objects
         :rtype: list[AssetResponseDto]
         """
-        asset_list = self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=AssetVisibility.TIMELINE, with_exif=self.config.with_exif or None))
+        extra = {"with_exif": self.config.with_exif or None, "updated_after": self.config.updated_after}
+        asset_list = self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=AssetVisibility.TIMELINE, **extra))
         for visiblity_option in visibility_options:
             # Do not fetch agin for 'timeline', that's the default!
             if visiblity_option != AssetVisibility.TIMELINE:
-                asset_list += self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=visiblity_option, with_exif=self.config.with_exif or None))
+                asset_list += self.fetch_assets_with_options(MetadataSearchDto(is_not_in_album=is_not_in_album, visibility=visiblity_option, **extra))
         return asset_list
+
+    def fetch_assets_in_folder(self, folder: str) -> list[AssetResponseDto]:
+        """
+        Fetches every asset whose path starts with folder (which must end with "/"), subfolders included.
+        Immich matches originalPath as a substring of the asset's folder, so the result is filtered again here.
+
+        :param folder: The folder path with a trailing slash
+        :returns: The assets below the folder, with EXIF data
+        """
+        found: list[AssetResponseDto] = []
+        for visibility_option in [AssetVisibility.TIMELINE, AssetVisibility.ARCHIVE, AssetVisibility.HIDDEN]:
+            found += self.fetch_assets_with_options(MetadataSearchDto(original_path=folder, visibility=visibility_option, with_exif=True))
+        return [asset for asset in found if asset.original_path.startswith(folder)]
 
     # pylint: disable=R0914
     def fetch_assets_with_options(self, search_options: MetadataSearchDto) -> list[AssetResponseDto]:
@@ -1342,7 +1360,9 @@ class Configuration():
         "update_album_props_mode": 0,
         "max_retry_count": ApiClient.MAX_RETRY_COUNT_ON_TIMEOUT_DEFAULT,
         "threads": ApiClient.THREADS_DEFAULT,
-        "rules_dry_run": False
+        "rules_dry_run": False,
+        "incremental": False,
+        "state_file": "/script/state/organizer-state.json"
     }
 
     # Static (Global) configuration options
@@ -1410,6 +1430,8 @@ class Configuration():
         self.rules_file: Optional[str] = Utils.get_value_or_config_default('rules_file', args, None)
         self.rules_dry_run: bool = Utils.get_value_or_config_default('rules_dry_run', args, Configuration.CONFIG_DEFAULTS['rules_dry_run'])
         self.queue_api_key: Optional[str] = Utils.get_value_or_config_default('queue_api_key', args, None)
+        self.incremental: bool = Utils.get_value_or_config_default('incremental', args, Configuration.CONFIG_DEFAULTS['incremental'])
+        self.state_file: str = Utils.get_value_or_config_default('state_file', args, Configuration.CONFIG_DEFAULTS['state_file'])
 
         if self.mode != Configuration.SCRIPT_MODE_CREATE:
             # Override unattended if we're running in destructive mode
@@ -1641,6 +1663,11 @@ class Configuration():
                             help="Only log what the rule file would change. Folder albums are still created as usual.")
         parser.add_argument("--queue-api-key", default=None,
                             help="Admin API key used to read the job queues between rule file batches. Defaults to the API key of the run.")
+        parser.add_argument("--incremental", action="store_true",
+                            help="""Only fetch assets changed since the last completed run (recorded in --state-file).
+                                    Without a state file the run is a full run. Empty albums are not deleted in an incremental run.""")
+        parser.add_argument("--state-file", default=Configuration.CONFIG_DEFAULTS['state_file'],
+                            help="Where the start time of the last completed run is kept for --incremental.")
         return parser
 
     @staticmethod
@@ -2393,6 +2420,17 @@ class FolderAlbumCreator():
                 logging.debug("Albumprops: Finding, parsing and loading %s files with inheritance support", FolderAlbumCreator.ALBUMPROPS_FILE_NAME)
                 albumprops_cache = self.build_albumprops_cache()
 
+            # Incremental hook: fetch only what changed since the last completed run (see incremental.py)
+            run_started = incremental.now()
+            account = str(self.api_client.fetch_my_user().id)
+            if self.config.incremental:
+                self.api_client.config.updated_after = incremental.window(incremental.read_state(self.config.state_file, account))
+            is_incremental = self.api_client.config.updated_after is not None
+            if is_incremental:
+                logging.info("Incremental run: assets updated after %s", self.api_client.config.updated_after.isoformat(timespec="seconds"))
+            else:
+                logging.info("Full run")
+
             logging.info("Requesting all assets")
             # only request images that are not in any album if we are running in CREATE mode,
             # otherwise we need all images, even if they are part of an album
@@ -2509,11 +2547,12 @@ class FolderAlbumCreator():
             logging.info("%d albums created", len(created_albums))
 
             # Organizer hook: apply the rule file (tags, albums, visibility) with pacing
+            rules_done = True
             if organizer:
-                await organizer.run_rules(assets)
+                rules_done = await organizer.run_rules(assets)
 
-            # Perform album cover randomization
-            if self.config.set_album_thumbnail == Configuration.ALBUM_THUMBNAIL_RANDOM_ALL:
+            # Perform album cover randomization (not in an incremental run: it reads every album)
+            if self.config.set_album_thumbnail == Configuration.ALBUM_THUMBNAIL_RANDOM_ALL and not is_incremental:
                 logging.info("Picking a new random thumbnail for all albums")
                 albums = self.api_client.fetch_albums()
                 for a in albums:
@@ -2543,7 +2582,8 @@ class FolderAlbumCreator():
             # Attention: Since Offline Asset Removal is an asynchronous job,
             # albums affected by it are most likely not empty yet! So this
             # might only be effective in the next script run.
-            if self.config.sync_mode >= 1:
+            # An incremental run saw only part of the library, so it never deletes an album.
+            if self.config.sync_mode >= 1 and not is_incremental:
                 logging.info("Deleting all empty albums")
                 albums = self.api_client.fetch_albums()
                 # pylint: disable=C0103
@@ -2561,6 +2601,11 @@ class FolderAlbumCreator():
                 else:
                     logging.info("No empty albums found!")
 
+            if self.config.incremental and rules_done and not self.config.rules_dry_run:
+                # Written only after a complete run, so a crashed or stopped run covers its window again next time.
+                incremental.write_state(self.config.state_file, account, run_started)
+            elif self.config.incremental:
+                logging.warning("Rules did not finish or ran dry, state file not advanced: the next incremental run covers this window again")
             logging.info("Done!")
 
 class Utils:

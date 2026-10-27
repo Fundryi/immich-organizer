@@ -272,6 +272,9 @@ The environment variables are analogous to the script's command line arguments.
 | `RULES_YAML`                 | no         | `-`              | The whole rule file as text (a YAML block scalar in a compose file). The container writes it to `/tmp/rules.yaml` and uses that as `RULES_FILE`. For setups where only the app YAML can be edited, such as TrueNAS apps. |
 | `RULES_DRY_RUN`              | no         | `0`              | Set to `1` to only log what the rule file would change. Folder albums are still created. |
 | `QUEUE_API_KEY`              | no         | `-`              | Admin API key used to read the job queues between rule file batches. Defaults to `API_KEY`. |
+| `INCREMENTAL`                | no         | `0`              | Set to `1` to fetch only assets changed since the last completed run (Immich `updatedAfter`, with a 10 minute overlap). The first run without a state file is a full run. An incremental run never deletes empty albums and skips `random-all` thumbnails. See [Incremental runs](#incremental-runs-this-fork). |
+| `STATE_FILE`                 | no         | `/script/state/organizer-state.json` | Where the start time of the last completed run is kept. Mount a volume on `/script/state` so it survives a container restart. |
+| `FULL_RUN_CRON`              | no         | `-`              | A second cron line that runs a full run (`INCREMENTAL=0`), e.g. `0 4 * * *` for once a night, next to incremental runs on `CRON_EXPRESSION`. An incremental run that would start while the full run is still going is skipped. |
 
 #### Run the container with Docker
 
@@ -552,6 +555,14 @@ How a run works:
 3. `--rules-dry-run` (`RULES_DRY_RUN=1`) logs the plan and writes nothing. Folder albums are still created as usual. Use it before the first real run.
 4. Writes go in batches of 50 assets. After every batch the script checks the Immich job queues `sidecar`, `metadataExtraction` and `storageTemplateMigration` and waits while one of them holds more than 300 jobs, because every tag or date write makes Immich write a sidecar file and re-read the file's metadata. A whole library at once can run the server out of memory; a bounded backlog keeps Immich busy in the background while the script moves on. Reading the queues needs an admin API key: pass it as `--queue-api-key` (`QUEUE_API_KEY`) when the run's key is not an admin key. If the queues cannot be read, nothing is written.
 5. The script never renames, merges or deletes tags or albums outside name repair. Album repair only touches folder albums of this run. Tag repair touches tags listed in `rename_tags` or detected as damaged. Tags cannot be renamed through the Immich API, so a tag repair creates the new tag, copies the assets over in paced batches, removes the old tag from them and deletes the old tag only when it is empty. If the fixed tag already exists, the assets are merged into it. Files and folders on disk are never touched.
+
+## Incremental runs (this fork)
+
+A full run reads the whole library (about 17 minutes for 180,000 assets with four threads). With `--incremental` (`INCREMENTAL=1`) the script asks Immich only for assets whose `updatedAt` lies after the start of the last completed run minus 10 minutes, and runs the folder albums and the rules on that subset. The start time is written to `--state-file` (`STATE_FILE`) only when a run completes, so a crashed run covers its window again. Without a state file the run is a full run.
+
+What an incremental run does differently: it never deletes empty albums (`SYNC_MODE`) and skips `random-all` thumbnails, because it has not seen the whole library. The done-checks of the rules read only the window. `order_by_name` fetches the whole post folder of every changed page before it sets dates, so a half-seen post does not get half its dates. Tag and date writes make Immich rewrite the sidecar, which bumps `updatedAt`, so the next incremental run sees those assets again; the log line "re-seen with nothing to change" counts them.
+
+Keep one full run a day with `FULL_RUN_CRON` (for example `0 4 * * *`) to catch deletions, hand changes and anything an incremental run missed; then `CRON_EXPRESSION` can be `*/15 * * * *`. The container takes a lock in the state directory, so an incremental run that would start during the full run is skipped.
 
 ## Filtering
 

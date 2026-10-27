@@ -312,6 +312,7 @@ class Plan:
     raw_album_names: dict[str, str] = field(default_factory=dict)
     album_orders: dict[str, str] = field(default_factory=dict)
     groups: dict[str, dict[Any, Any]] = field(default_factory=lambda: defaultdict(dict))
+    group_matches: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
     dates: dict[Any, str] = field(default_factory=dict)
 
 
@@ -447,11 +448,13 @@ class Organizer:
         old.album_name = fixed
         by_name[nfc(fixed)] = by_name.pop(nfc(name))
 
-    async def run_rules(self, assets: list[Any]) -> None:
+    async def run_rules(self, assets: list[Any]) -> bool:  # pylint: disable=too-many-return-statements
         """
         Plans tags, albums and visibility for the assets, skips what is already done, and unless dry run
         writes in batches of 50 and waits after each batch while an Immich queue holds more than MAX_BACKLOG jobs. Tag renames run first.
         Problems that stop the writes are logged, not raised, so the rest of the upstream run still goes on.
+
+        :returns: True when every planned write was done (or there was nothing to do, or dry run), False when the writes stopped
         """
         if not (self.config.find_assets_in_albums and self.config.find_archived_assets):
             logging.warning("Rules see only part of the library: turn on FIND_ASSETS_IN_ALBUMS and FIND_ARCHIVED_ASSETS to cover assets in albums and archived assets")
@@ -463,25 +466,29 @@ class Organizer:
         albums = _drop_unsafe_albums(plan, self.api_client.fetch_albums()) if plan.albums or plan.album_orders else {}
         self._skip_done(plan, tags, albums)
         totals = _log_plan(repairs, plan)
+        if getattr(self.api_client.config, "updated_after", None):
+            # Our own writes bump updatedAt (sidecar and metadata), so a changed asset is often one we touched last run.
+            touched = set().union(*plan.tags.values(), *plan.albums.values(), *plan.visibility.values(), plan.dates)
+            logging.info("Rules: %d of %d changed assets re-seen with nothing to change", sum(a.id not in touched for a in assets), len(assets))
         if conflicts:
             logging.error("Rules both assign and repair the tags %s, rules write nothing. Fix the rule file.", ", ".join(conflicts))
-            return
+            return False
         if self.config.rules_dry_run:
             logging.info("Rules dry run: nothing was written")
-            return
+            return True
         if not any(totals):
-            return
+            return True
 
         queue_client = await self._open_queue_client()
         if queue_client is None:
-            return
+            return False
         try:
             queue_client.fetch_queues()
         except Exception as e:  # pylint: disable=broad-exception-caught
             # Without the queues the writes cannot be paced, so write nothing at all.
             logging.error("Cannot read the Immich queues (QUEUE_API_KEY must be an admin key), rules write nothing: %s", e)
             await self._close_queue_client(queue_client)
-            return
+            return False
         try:
             self._wait_idle(queue_client)
             for tag, fixed in repairs:
@@ -491,9 +498,11 @@ class Organizer:
             self._write_visibility(plan.visibility, queue_client)
             self._in_batches(set(plan.dates), lambda batch: [self.api_client.set_asset_date(i, plan.dates[i]) for i in batch], queue_client)
             logging.info("Rules applied: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes", *totals)
+            return True
         except RuntimeError as e:
             # A paused queue or a timeout stops the rules only; upstream's remaining steps and the next API key still run.
             logging.error("%s", e)
+            return False
         finally:
             await self._close_queue_client(queue_client)
 
@@ -537,6 +546,7 @@ class Organizer:
                 if "order_by_name" in actions and (group := folder_name_for(asset, actions["order_by_name"])):
                     # Keyed by the full folder path, and by asset id, so two rules cannot merge or double a group.
                     plan.groups[actions["order_by_name"]["strip_prefix"] + group][asset.id] = asset
+                    plan.group_matches[actions["order_by_name"]["strip_prefix"] + group].append(rule["match"])
                 if "visibility" in actions:
                     visibilities.append(actions["visibility"])
             if len(set(visibilities)) > 1:
@@ -545,8 +555,23 @@ class Organizer:
                 plan.visibility[visibilities[-1]].add(asset.id)
         for path in sorted(plan.tags):
             logging.info("Rules: tag '%s' matches %d assets", path, len(plan.tags[path]))
+        self._complete_groups(plan)
         plan.dates = plan_dates(plan.groups)
         return plan
+
+    def _complete_groups(self, plan: Plan) -> None:
+        # An incremental run sees only the changed pages of a post; the dates need the whole post folder,
+        # else the pages outside the window would be left on dates that no longer sort with the rest.
+        if not getattr(self.api_client.config, "updated_after", None):
+            return
+        me = self.api_client.fetch_my_user()
+        for folder, by_id in plan.groups.items():
+            changed = len(by_id)
+            for asset in self.api_client.fetch_assets_in_folder(folder + "/"):
+                # Only pages the same rules would have grouped in a full run.
+                if any(matches(match, asset, me) for match in plan.group_matches[folder]):
+                    by_id.setdefault(asset.id, asset)
+            logging.info("Rules: order '%s': %d changed pages, post completed to %d", folder, changed, len(by_id))
 
     def _folder_album(self, asset: Any, spec: dict[str, Any], plan: Plan) -> str | None:
         # Repaired, else a broken folder name creates the broken album again on every run.
@@ -566,12 +591,14 @@ class Organizer:
         return name.strip() if name else name
 
     def _skip_done(self, plan: Plan, tags: dict[str, Any], albums: dict[str, Any]) -> None:
+        # In an incremental run the planned assets all lie in the window, so the done-check reads only the window too.
+        since = {"updated_after": self.api_client.config.updated_after} if getattr(self.api_client.config, "updated_after", None) else {}
         for path, ids in plan.tags.items():
             if path in tags:
-                ids -= self.api_client.fetch_asset_ids(tag_ids=[tags[path].id])
+                ids -= self.api_client.fetch_asset_ids(tag_ids=[tags[path].id], **since)
         for name, ids in plan.albums.items():
             if name in albums:
-                ids -= self.api_client.fetch_asset_ids(album_ids=[albums[name].id])
+                ids -= self.api_client.fetch_asset_ids(album_ids=[albums[name].id], **since)
         plan.tags = {path: ids for path, ids in plan.tags.items() if ids}
         plan.albums = {name: ids for name, ids in plan.albums.items() if ids}
         def order_needed(name: str, order: str) -> bool:

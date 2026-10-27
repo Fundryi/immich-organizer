@@ -8,7 +8,7 @@ ENV SUPERCRONIC_URL_BASE=https://github.com/aptible/supercronic/releases/downloa
     CRONTAB_DIR=/script/cron \
     IS_DOCKER=1
 
-COPY immich_auto_album.py organizer.py requirements.txt docker/immich_auto_album.sh docker/setup_cron.sh docker/util.sh /script/
+COPY immich_auto_album.py organizer.py incremental.py requirements.txt docker/immich_auto_album.sh docker/setup_cron.sh docker/util.sh /script/
 
 # gcc and musl-dev are required for building requirements for regex python module
 RUN <<EOT
@@ -31,9 +31,9 @@ chmod +x "$SUPERCRONIC"
 mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}"
 ln -s "/usr/local/bin/${SUPERCRONIC}" /usr/local/bin/supercronic
 apk del curl
-# Prepare crontab
-mkdir $CRONTAB_DIR
-chmod 0777 $CRONTAB_DIR
+# Prepare crontab and the state dir for incremental runs (mount a volume there to keep it across restarts)
+mkdir $CRONTAB_DIR /script/state
+chmod 0777 $CRONTAB_DIR /script/state
 EOT
 
 WORKDIR /script

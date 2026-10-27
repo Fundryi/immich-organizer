@@ -274,5 +274,13 @@ if [ ! -z "$QUEUE_API_KEY" ]; then
     args="--queue-api-key \"$QUEUE_API_KEY\" $args"
 fi
 
+if is_env_var_true "INCREMENTAL"; then
+    args="--incremental $args"
+fi
+
+if [ ! -z "$STATE_FILE" ]; then
+    args="--state-file \"$STATE_FILE\" $args"
+fi
+
 BASEDIR=$(dirname "$0")
 echo $args | xargs python3 -u $BASEDIR/immich_auto_album.py

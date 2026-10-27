@@ -31,6 +31,14 @@ if [ -n "$CRON_EXPRESSION" ]; then
 
     # populate crontab
     echo "$CRON_EXPRESSION UNATTENDED=1 /script/immich_auto_album.sh > /proc/1/fd/1 2>/proc/1/fd/2" > "$CRONTAB_PATH"
+    # FULL_RUN_CRON adds a daily full run next to incremental runs on CRON_EXPRESSION. The lock keeps an
+    # incremental run from starting while the full run is still going (it is skipped, not queued).
+    if [ -n "${FULL_RUN_CRON:-}" ]; then
+        LOCK="$(dirname "${STATE_FILE:-/script/state/organizer-state.json}")/run.lock"
+        mkdir -p "$(dirname "$LOCK")"
+        echo "$CRON_EXPRESSION UNATTENDED=1 flock -n \"$LOCK\" /script/immich_auto_album.sh > /proc/1/fd/1 2>/proc/1/fd/2" > "$CRONTAB_PATH"
+        echo "$FULL_RUN_CRON UNATTENDED=1 INCREMENTAL=0 flock \"$LOCK\" /script/immich_auto_album.sh > /proc/1/fd/1 2>/proc/1/fd/2" >> "$CRONTAB_PATH"
+    fi
     
     # SuperCronic debug logging
     DEBUG_PARM=""

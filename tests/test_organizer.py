@@ -27,7 +27,8 @@ class FakeApi:
     """Records every call and serves canned tags, albums and queues."""
 
     def __init__(self, api_url="http://immich", api_key="key", config=None):
-        self.api_url, self.api_key, self.config = api_url, api_key, config
+        self.api_url, self.api_key, self.config = api_url, api_key, config or NS(updated_after=None)
+        self.folders = {}
         self.calls = []
         self.tags = []
         self.tag_members = {}
@@ -87,6 +88,10 @@ class FakeApi:
 
     def fetch_albums(self):
         return list(self.albums)
+
+    def fetch_assets_in_folder(self, folder):
+        self.calls.append(("fetch_assets_in_folder", folder))
+        return list(self.folders.get(folder, []))
 
     def create_album(self, name):
         self.calls.append(("create_album", name))
@@ -762,3 +767,44 @@ def test_order_by_name_groups_do_not_double_or_merge_across_rules(tmp_path):
     run(make(tmp_path, text, api), [*comic, scan])
     dates = {c[1]: c[2] for c in api.calls if c[0] == "set_asset_date"}
     assert dates == {comic[1].id: T0.isoformat(), comic[0].id: (T0 + s).isoformat()}
+
+
+def test_incremental_run_completes_the_post_and_checks_only_the_window(tmp_path):
+    api = FakeApi(config=NS(updated_after=T0))
+    s = timedelta(seconds=1)
+    old = [asset("/mnt/G/P/1.png", created=T0 - 9 * s), asset("/mnt/G/P/2.png", created=T0 - 8 * s)]
+    new = asset("/mnt/G/P/0.png", created=T0 + s)   # the one changed page sorts first by name
+    api.folders["/mnt/G/P/"] = old + [new]
+    tag = api.add_tag("New", members={old[0].id})
+    text = "rules:\n  - actions: {tag: New, order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n"
+    run(make(tmp_path, text, api), [new])
+    dates = {c[1]: c[2] for c in api.calls if c[0] == "set_asset_date"}
+    assert dates == {new.id: (T0 - 9 * s).isoformat(), old[0].id: (T0 - 8 * s).isoformat(), old[1].id: (T0 - 7 * s).isoformat()}
+    assert ("fetch_asset_ids", {"tag_ids": [tag.id], "updated_after": T0}) in api.calls
+    assert ("tag_assets", tag.id, [new.id]) in api.calls
+
+
+def test_full_run_does_not_fetch_folders(tmp_path):
+    api = FakeApi()
+    run(make(tmp_path, "rules:\n  - actions: {order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n", api), [asset("/mnt/G/P/1.png")])
+    assert "fetch_assets_in_folder" not in api.names()
+
+
+def test_post_completion_respects_the_rule_match(tmp_path):
+    api = FakeApi(config=NS(updated_after=T0))
+    s = timedelta(seconds=1)
+    new = asset("/mnt/G/P/2.png", created=T0 + s)
+    kept, excluded = asset("/mnt/G/P/1.png", created=T0 + 2 * s), asset("/mnt/G/P/cover.jpg", created=T0)
+    api.folders["/mnt/G/P/"] = [new, kept, excluded]
+    text = "rules:\n  - match: {extension: .png}\n    actions: {order_by_name: {strip_prefix: /mnt/G/, levels: 1}}\n"
+    run(make(tmp_path, text, api), [new])
+    dates = {c[1]: c[2] for c in api.calls if c[0] == "set_asset_date"}
+    assert dates == {kept.id: (T0 + s).isoformat(), new.id: (T0 + 2 * s).isoformat()}
+
+
+def test_run_rules_reports_whether_the_writes_finished(tmp_path):
+    api = FakeApi()
+    assert asyncio.run(make(tmp_path, "rules:\n  - actions: {tag: X}\n", api).run_rules([asset()])) is True
+    api.paused = True
+    assert asyncio.run(make(tmp_path, "rules:\n  - actions: {tag: X}\n", api).run_rules([asset()])) is False
+    assert asyncio.run(make(tmp_path, "rules:\n  - actions: {tag: X}\n", api, dry_run=True).run_rules([asset()])) is True
