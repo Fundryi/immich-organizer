@@ -1,0 +1,14 @@
+services:
+  immich-organizer:
+    build: .
+    image: immich-organizer:local
+    restart: unless-stopped
+    # Everything the organizer needs (API_URL, API_KEY, CRON_EXPRESSION, ...) comes from this file.
+    env_file:
+      - ${ORGANIZER_ENV:-/srv/docker-data/immich-organizer/organizer.env}
+    environment:
+      RULES_FILE: /script/rules.yaml
+      STATE_FILE: /script/state/organizer-state.json
+    volumes:
+      - ${DATA_PATH:-/srv/docker-data/immich-organizer}/rules.yaml:/script/rules.yaml:ro
+      - ${DATA_PATH:-/srv/docker-data/immich-organizer}/state:/script/state
