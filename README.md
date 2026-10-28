@@ -542,11 +542,14 @@ rules:
       folder_album: {strip_prefix: "/mnt/pictures/Trips/", levels: 1, prefix: "Trips / ", order: asc}   # one album per trip folder, oldest first
       order_by_name: {strip_prefix: "/mnt/pictures/Comics/", levels: 1}   # pages of one comic folder get dates in file name order
       visibility: archive             # archive, hidden or timeline
+      dismiss_duplicates: true        # dismiss duplicate groups whose members all match this rule
 ```
 
 `folder_tag` and `folder_album` take the first `levels` folders after `strip_prefix` (which must end with `/`, never the file name) and join them with `/` for a tag or with ` / ` for an album; `prefix` goes in front. Fewer folders than `levels` means no tag or album for that asset. Folder album names go through the same `ALBUM_NAME_POST_REGEX` as upstream's albums. `order` (`asc` or `desc`) sets the sort order of the album, also on an album that already exists with the other order. With `UPDATE_ALBUM_PROPS_MODE=1` upstream resets the order of its own albums to `ALBUM_ORDER` on every run before the rules set it back, so use the rule order with mode `0`.
 
 `order_by_name` is for comics and other page sets: Immich sorts an album by date only, so the pages of a folder that were downloaded out of order show out of order. The action groups the assets by the first `levels` folders after `strip_prefix`, sorts each group by file name with numbers read as numbers (`2.png` before `10.png`), and sets the date taken to the group's earliest date plus one second per page. A group whose dates already rise in name order is left alone, and so is a group with a file name that does not start with a digit. Immich writes every changed date into an XMP sidecar file next to the original (`x.png.xmp`), which is the only file this tool ever causes to be written on disk.
+
+`dismiss_duplicates` keeps a folder out of Immich's duplicate tool, which has no folder exclusion of its own: comic pages with and without text, or edits next to their original, fill it with pairs that are not duplicates. The action reads every duplicate group of the account and dismisses a group (the same as "Keep all" in the UI) when every member of the group matches the rule. One member outside the rule and the group stays, because that one is a real duplicate. Dismissed groups leave the duplicate tool and Immich does not regroup them unless the admin job "Duplicate detection: ALL" runs; the next run then dismisses them again. The dry run lists the groups with their paths.
 
 How a run works:
 
@@ -560,7 +563,7 @@ How a run works:
 
 A full run reads the whole library (about 17 minutes for 180,000 assets with four threads). With `--incremental` (`INCREMENTAL=1`) the script asks Immich only for assets whose `updatedAt` lies after the start of the last completed run minus 10 minutes, and runs the folder albums and the rules on that subset. The start time is written to `--state-file` (`STATE_FILE`) only when a run completes, so a crashed run covers its window again. Without a state file the run is a full run.
 
-What an incremental run does differently: it never deletes empty albums (`SYNC_MODE`) and skips `random-all` thumbnails, because it has not seen the whole library. The done-checks of the rules read only the window. `order_by_name` fetches the whole post folder of every changed page before it sets dates, so a half-seen post does not get half its dates. Tag and date writes make Immich rewrite the sidecar, which bumps `updatedAt`, so the next incremental run sees those assets again; the log line "re-seen with nothing to change" counts them.
+What an incremental run does differently: it never deletes empty albums (`SYNC_MODE`) and skips `random-all` thumbnails, because it has not seen the whole library. The done-checks of the rules read only the window. `order_by_name` fetches the whole post folder of every changed page before it sets dates, so a half-seen post does not get half its dates. `dismiss_duplicates` reads the duplicate groups only when a changed asset matches a dismiss rule (a new file gets its group minutes after import), a full run always reads them. Tag and date writes make Immich rewrite the sidecar, which bumps `updatedAt`, so the next incremental run sees those assets again; the log line "re-seen with nothing to change" counts them.
 
 Keep one full run a day with `FULL_RUN_CRON` (for example `0 4 * * *`) to catch deletions, hand changes and anything an incremental run missed; then `CRON_EXPRESSION` can be `*/15 * * * *`. The container takes a lock in the state directory, so an incremental run that would start during the full run is skipped.
 

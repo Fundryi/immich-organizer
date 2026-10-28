@@ -1,4 +1,4 @@
-# pylint: disable=missing-docstring,too-many-arguments,too-many-positional-arguments,too-many-instance-attributes,too-few-public-methods
+# pylint: disable=missing-docstring,too-many-arguments,too-many-positional-arguments,too-many-instance-attributes,too-few-public-methods,too-many-public-methods
 from __future__ import annotations
 import asyncio
 import logging
@@ -34,6 +34,7 @@ class FakeApi:
         self.tag_members = {}
         self.albums = []
         self.album_members = {}
+        self.duplicates = []
         self.busy_polls = 0
         self.paused = False
         self.queue_error = None
@@ -112,6 +113,13 @@ class FakeApi:
 
     def set_asset_date(self, asset_id, date):
         self.calls.append(("set_asset_date", asset_id, date))
+
+    def fetch_duplicates(self):
+        self.calls.append(("fetch_duplicates",))
+        return list(self.duplicates)
+
+    def dismiss_duplicates(self, ids):
+        self.calls.append(("dismiss_duplicates", list(ids)))
 
     def fetch_queues(self):
         self.calls.append(("fetch_queues",))
@@ -411,10 +419,33 @@ def test_last_visibility_wins_and_conflict_warns(tmp_path, caplog):
 def test_dry_run_writes_nothing(tmp_path):
     api = FakeApi()
     api.add_tag(BROKEN, members={uuid4()})
-    text = "repair_names: true\nrules:\n  - actions: {tag: New, album: New, visibility: archive}\n"
+    api.duplicates = [NS(duplicate_id=uuid4(), assets=[asset(), asset()])]
+    text = "repair_names: true\nrules:\n  - actions: {tag: New, album: New, visibility: archive, dismiss_duplicates: true}\n"
     run(make(tmp_path, text, api, dry_run=True), [asset(), asset()])
     assert not api.writes()
     assert "fetch_queues" not in api.names()
+
+
+DUP_RULE = "rules:\n  - match: {path_like: ['/Comics/']}\n    actions: {dismiss_duplicates: true}\n"
+
+
+def test_dismiss_duplicates_only_groups_whose_members_all_match(tmp_path):
+    api = FakeApi()
+    inside = NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/1.png"), asset("/x/Comics/a/Textless/1.png")])
+    mixed = NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/2.png"), asset("/x/Other/2.png")])
+    outside = NS(duplicate_id=uuid4(), assets=[asset("/x/Other/3.png"), asset("/x/Other/3 (1).png")])
+    api.duplicates = [inside, mixed, outside]
+    run(make(tmp_path, DUP_RULE, api), [])
+    assert [c for c in api.calls if c[0] == "dismiss_duplicates"] == [("dismiss_duplicates", [inside.duplicate_id])]
+
+
+def test_incremental_run_reads_duplicates_only_when_a_changed_asset_matches(tmp_path):
+    api = FakeApi(config=NS(updated_after=T0))
+    api.duplicates = [NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/1.png")])]
+    run(make(tmp_path, DUP_RULE, api), [asset("/x/Other/1.png")])
+    assert "fetch_duplicates" not in api.names()
+    run(make(tmp_path, DUP_RULE, api), [asset("/x/Comics/b/1.png")])
+    assert "dismiss_duplicates" in api.writes()
 
 
 def test_writes_in_batches_of_50_with_a_queue_wait_after_each(tmp_path):

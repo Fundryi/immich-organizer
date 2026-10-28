@@ -40,6 +40,7 @@ from immichpy.client.generated import (
     AssetVisibility,
     BulkIdsDto,
     CreateAlbumDto,
+    DuplicateResponseDto,
     LibraryResponseDto,
     MetadataSearchDto,
     QueueResponseDto,
@@ -866,6 +867,23 @@ class ApiClient:
         :rtype: list[QueueResponseDto]
         """
         return self.__request_api(lambda c: c.queues.get_queues())
+
+    def fetch_duplicates(self) -> list[DuplicateResponseDto]:
+        """
+        Fetches every duplicate group of the API key's user with the member assets.
+
+        :returns: The duplicate groups
+        :rtype: list[DuplicateResponseDto]
+        """
+        return self.__request_api(lambda c: c.duplicates.get_asset_duplicates())
+
+    def dismiss_duplicates(self, duplicate_ids: list[UUID]) -> None:
+        """
+        Dismisses duplicate groups the way "Keep all" does in the UI: the members lose their duplicate id, nothing else changes.
+
+        :param duplicate_ids: The duplicate group IDs
+        """
+        self.__request_api(lambda c: c.duplicates.delete_duplicates(bulk_ids_dto=BulkIdsDto(ids=duplicate_ids)))
 
     def fetch_my_user(self) -> UserAdminResponseDto:
         """

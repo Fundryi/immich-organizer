@@ -31,7 +31,7 @@ TOP_LEVEL_KEYS = {"keep_empty_albums", "repair_names", "rename_tags", "rename_al
 TEXT_MATCH_KEYS = {"path_like", "path_not_like", "name_like", "name_regex", "extension", "type", "account", "make_like", "model_like"}
 NUMBER_MATCH_KEYS = {"min_size_mb", "max_size_mb", "min_long_side", "max_long_side", "min_duration_s", "max_duration_s"}
 TAG_GROUP = re.compile(r"\{(\d)\}")
-ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility", "order_by_name"}
+ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility", "order_by_name", "dismiss_duplicates"}
 FOLDER_SPEC_KEYS = {"folder_tag": {"prefix"}, "folder_album": {"prefix", "order"}, "order_by_name": set()}
 ALBUM_SEPARATOR = " / "
 ALBUM_ORDERS = {"asc", "desc"}
@@ -138,6 +138,8 @@ def _check_rule(where: str, rule: Any) -> dict[str, Any]:
         _fail(f"{where}.actions.album", "must be a non-empty string")
     if "visibility" in actions and actions["visibility"] not in VISIBILITIES:
         _fail(f"{where}.actions.visibility", f"must be one of {', '.join(sorted(VISIBILITIES))}")
+    if "dismiss_duplicates" in actions and actions["dismiss_duplicates"] is not True:
+        _fail(f"{where}.actions.dismiss_duplicates", "must be true")
     for key, extra in FOLDER_SPEC_KEYS.items():
         if key in actions:
             actions = {**actions, key: _check_folder_spec(f"{where}.actions.{key}", actions[key], extra)}
@@ -304,8 +306,8 @@ def _first_by_name(albums: list[Any]) -> dict[str, Any]:
 
 
 @dataclass
-class Plan:
-    """What one run has to write: asset ids per tag, album and visibility, album orders, dates per asset id."""
+class Plan:  # pylint: disable=too-many-instance-attributes
+    """What one run has to write: asset ids per tag, album and visibility, album orders, dates per asset id, duplicate groups to dismiss."""
     tags: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
     albums: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
     visibility: dict[str, set[Any]] = field(default_factory=lambda: defaultdict(set))
@@ -314,6 +316,9 @@ class Plan:
     groups: dict[str, dict[Any, Any]] = field(default_factory=lambda: defaultdict(dict))
     group_matches: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
     dates: dict[Any, str] = field(default_factory=dict)
+    duplicates: dict[Any, list[str]] = field(default_factory=dict)
+    # An incremental run reads the duplicate groups only when a changed asset matched a dismiss_duplicates rule.
+    duplicates_hit: bool = False
 
 
 def natural_key(name: str) -> list[Any]:
@@ -373,9 +378,12 @@ def _log_plan(repairs: list[tuple[Any, str]], plan: Plan) -> tuple[int, ...]:
             logging.info("Rules: %s '%s': %d assets to change", label, name, len(ids))
     for name, order in sorted(plan.album_orders.items()):
         logging.info("Rules: album '%s': order to set to %s", name, order)
+    for group_id, paths in plan.duplicates.items():
+        logging.info("Rules: dismiss duplicate group %s: %s", group_id, ", ".join(paths))
     totals = (len(repairs), *(sum(len(ids) for ids in items.values()) for items in (plan.tags, plan.albums, plan.visibility)),
-              len(plan.album_orders), len(plan.dates))
-    logging.info("Rules plan: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes", *totals)
+              len(plan.album_orders), len(plan.dates), len(plan.duplicates))
+    logging.info("Rules plan: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes, "
+                 "%d duplicate groups to dismiss", *totals)
     return totals
 
 
@@ -497,7 +505,9 @@ class Organizer:
             self._write_albums(plan, albums, queue_client)
             self._write_visibility(plan.visibility, queue_client)
             self._in_batches(set(plan.dates), lambda batch: [self.api_client.set_asset_date(i, plan.dates[i]) for i in batch], queue_client)
-            logging.info("Rules applied: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes", *totals)
+            self._in_batches(set(plan.duplicates), self.api_client.dismiss_duplicates, queue_client)
+            logging.info("Rules applied: %d tag renames, %d tag assignments, %d album additions, %d visibility changes, %d album order changes, %d date changes, "
+                         "%d duplicate groups dismissed", *totals)
             return True
         except RuntimeError as e:
             # A paused queue or a timeout stops the rules only; upstream's remaining steps and the next API key still run.
@@ -524,7 +534,7 @@ class Organizer:
         if queue_client is not self.api_client:
             await queue_client.__aexit__(None, None, None)
 
-    def _plan(self, assets: list[Any]) -> Plan:
+    def _plan(self, assets: list[Any]) -> Plan:  # pylint: disable=too-many-branches
         me = self.api_client.fetch_my_user()
         plan = Plan()
         for asset in assets:
@@ -549,6 +559,8 @@ class Organizer:
                     plan.group_matches[actions["order_by_name"]["strip_prefix"] + group].append(rule["match"])
                 if "visibility" in actions:
                     visibilities.append(actions["visibility"])
+                if "dismiss_duplicates" in actions:
+                    plan.duplicates_hit = True
             if len(set(visibilities)) > 1:
                 logging.warning("Rules give %s more than one visibility, the last matching rule wins", asset.original_path)
             if visibilities and asset.visibility.value != visibilities[-1]:
@@ -557,7 +569,24 @@ class Organizer:
             logging.info("Rules: tag '%s' matches %d assets", path, len(plan.tags[path]))
         self._complete_groups(plan)
         plan.dates = plan_dates(plan.groups)
+        self._plan_duplicates(plan, me)
         return plan
+
+    def _plan_duplicates(self, plan: Plan, me: Any) -> None:
+        # A group is dismissed (Immich's "Keep all") when every member matches one dismiss_duplicates rule; one member
+        # outside the rule and the group stays, those are real duplicates. Dismissed groups leave GET /duplicates, so
+        # there is no done-check and a rerun after the admin job "Duplicate detection: ALL" dismisses them again.
+        rules = [rule["match"] for rule in self.rules["rules"] if "dismiss_duplicates" in rule["actions"]]
+        if not rules:
+            return
+        if getattr(self.api_client.config, "updated_after", None) and not plan.duplicates_hit:
+            logging.info("Rules: no changed asset matches a dismiss_duplicates rule, duplicate groups not read")
+            return
+        groups = self.api_client.fetch_duplicates()
+        for group in groups:
+            if any(all(matches(match, member, me) for member in group.assets) for match in rules):
+                plan.duplicates[group.duplicate_id] = [member.original_path for member in group.assets]
+        logging.info("Rules: %d of %d duplicate groups to dismiss", len(plan.duplicates), len(groups))
 
     def _complete_groups(self, plan: Plan) -> None:
         # An incremental run sees only the changed pages of a post; the dates need the whole post folder,
