@@ -208,10 +208,12 @@ class ApiClient:
                 self._loop.run_until_complete(self._loop.shutdown_asyncgens())
                 self._loop.close()
 
+        # A daemon thread, so an error that escapes before __aexit__ (a failed connect after the retries) ends the
+        # process instead of leaving it waiting on this loop forever, holding the cron lock.
         self._thread = threading.Thread(
             target=run_loop,
             name="immich-api-client-loop",
-            daemon=False,
+            daemon=True,
         )
         self._thread.start()
 
