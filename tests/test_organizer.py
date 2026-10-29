@@ -18,9 +18,11 @@ ME = NS(name="alice", email="alice@example.com")
 QUEUE_NAMES = ["sidecar", "metadataExtraction", "storageTemplateMigration", "thumbnailGeneration"]
 
 
-def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline", camera=(None, None), created=T0):
+def asset(path="/lib/a.jpg", kind="IMAGE", size=None, width=None, height=None, duration=None, vis="timeline", camera=(None, None), created=T0,
+          library_id=None):
     return NS(id=uuid4(), original_path=path, original_file_name=path.rsplit("/", 1)[-1], type=NS(value=kind), visibility=NS(value=vis),
-              width=width, height=height, duration=duration, file_created_at=created, exif_info=NS(file_size_in_byte=size, make=camera[0], model=camera[1]))
+              width=width, height=height, duration=duration, file_created_at=created, exif_info=NS(file_size_in_byte=size, make=camera[0], model=camera[1]),
+              library_id=library_id)
 
 
 class FakeApi:
@@ -120,6 +122,9 @@ class FakeApi:
 
     def dismiss_duplicates(self, ids):
         self.calls.append(("dismiss_duplicates", list(ids)))
+
+    def resolve_duplicates(self, groups):
+        self.calls.append(("resolve_duplicates", list(groups)))
 
     def fetch_queues(self):
         self.calls.append(("fetch_queues",))
@@ -437,6 +442,54 @@ def test_dismiss_duplicates_only_groups_whose_members_all_match(tmp_path):
     api.duplicates = [inside, mixed, outside]
     run(make(tmp_path, DUP_RULE, api), [])
     assert [c for c in api.calls if c[0] == "dismiss_duplicates"] == [("dismiss_duplicates", [inside.duplicate_id])]
+
+
+KEEP_RULE = "rules:\n  - match: {path_like: ['/Comics/']}\n    actions: {keep_duplicates: true}\n"
+
+
+def test_keep_duplicates_keeps_matching_members_and_trashes_the_other_uploads(tmp_path, caplog):  # pylint: disable=too-many-locals
+    api = FakeApi()
+    page, upload = asset("/x/Comics/a/1.png"), asset("/data/Other/1.png")
+    page2, ext = asset("/x/Comics/a/2.png"), asset("/x/Discord/2.png", library_id=uuid4())
+    page3, upload3, ext3 = asset("/x/Comics/a/3.png"), asset("/data/Other/3.png"), asset("/x/Discord/3.png", library_id=uuid4())
+    text4, textless4, upload4 = asset("/x/Comics/a/4.png"), asset("/x/Comics/a/Textless/4.png"), asset("/data/Other/4.png")
+    both_outside = NS(duplicate_id=uuid4(), assets=[asset("/data/Other/5.png"), asset("/data/Other/5 (1).png")])
+    plain = NS(duplicate_id=uuid4(), assets=[page, upload])
+    external = NS(duplicate_id=uuid4(), assets=[page2, ext])
+    mixed = NS(duplicate_id=uuid4(), assets=[page3, upload3, ext3])
+    two_keepers = NS(duplicate_id=uuid4(), assets=[text4, textless4, upload4])
+    api.duplicates = [plain, external, mixed, two_keepers, both_outside]
+    with caplog.at_level(logging.INFO):
+        run(make(tmp_path, KEEP_RULE, api), [])
+    resolved = [c for c in api.calls if c[0] == "resolve_duplicates"]
+    assert len(resolved) == 1
+    assert sorted(resolved[0][1], key=lambda g: str(g[0])) == sorted([
+        (plain.duplicate_id, [page.id], [upload.id]),
+        (mixed.duplicate_id, [page3.id, ext3.id], [upload3.id]),
+        (two_keepers.duplicate_id, [text4.id, textless4.id], [upload4.id]),
+    ], key=lambda g: str(g[0]))
+    assert "dismiss_duplicates" not in api.names()
+    assert "external copy left in place /x/Discord/2.png" in caplog.text
+    assert "1 to resolve" not in caplog.text and "3 to resolve" in caplog.text
+
+
+def test_dismiss_wins_over_keep_for_a_group_fully_inside(tmp_path):
+    api = FakeApi()
+    inside = NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/1.png"), asset("/x/Comics/a/Textless/1.png")])
+    api.duplicates = [inside]
+    text = "rules:\n  - match: {path_like: ['/Comics/']}\n    actions: {dismiss_duplicates: true, keep_duplicates: true}\n"
+    run(make(tmp_path, text, api), [])
+    assert "resolve_duplicates" not in api.names()
+    assert ("dismiss_duplicates", [inside.duplicate_id]) in api.calls
+
+
+def test_keep_duplicates_dry_run_writes_nothing(tmp_path, caplog):
+    api = FakeApi()
+    api.duplicates = [NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/1.png"), asset("/data/Other/1.png")])]
+    with caplog.at_level(logging.INFO):
+        run(make(tmp_path, KEEP_RULE, api, dry_run=True), [])
+    assert api.writes() == []
+    assert "1 duplicate groups to resolve" in caplog.text
 
 
 def test_incremental_run_reads_duplicates_only_when_a_changed_asset_matches(tmp_path):

@@ -328,3 +328,4 @@ rules:
   #     order_by_name: {strip_prefix: "/mnt/photos/Comics/", levels: 1}   # pages in a variant subfolder join the same sequence
   #     visibility: archive        # archive, hidden or timeline
   #     dismiss_duplicates: true   # a page with and without text is no duplicate: dismiss groups whose members all lie in /Comics/
+  #     keep_duplicates: true      # a copy of a page uploaded elsewhere is a duplicate: keep the page here, trash the copy

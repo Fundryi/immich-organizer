@@ -39,6 +39,8 @@ from immichpy.client.generated import (
     AssetResponseDto,
     AssetVisibility,
     BulkIdsDto,
+    DuplicateResolveDto,
+    DuplicateResolveGroupDto,
     CreateAlbumDto,
     DuplicateResponseDto,
     LibraryResponseDto,
@@ -884,6 +886,18 @@ class ApiClient:
         :param duplicate_ids: The duplicate group IDs
         """
         self.__request_api(lambda c: c.duplicates.delete_duplicates(bulk_ids_dto=BulkIdsDto(ids=duplicate_ids)))
+
+    def resolve_duplicates(self, groups: list[tuple[UUID, list[UUID], list[UUID]]]) -> None:
+        """
+        Resolves duplicate groups: the kept assets stay, the others go to the trash. With one kept asset Immich copies
+        albums, tags, favorite, rating, description and location onto it.
+
+        :param groups: (duplicate group ID, asset IDs to keep, asset IDs to trash) per group
+        """
+        dto = DuplicateResolveDto(groups=[DuplicateResolveGroupDto(duplicate_id=g, keep_asset_ids=k, trash_asset_ids=t) for g, k, t in groups])
+        for result in self.__request_api(lambda c: c.duplicates.resolve_duplicates(duplicate_resolve_dto=dto)) or []:
+            if not result.success:
+                logging.error("Duplicate group %s not resolved: %s", result.id, result.error)
 
     def fetch_my_user(self) -> UserAdminResponseDto:
         """
