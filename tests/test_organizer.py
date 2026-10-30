@@ -473,6 +473,18 @@ def test_keep_duplicates_keeps_matching_members_and_trashes_the_other_uploads(tm
     assert "1 to resolve" not in caplog.text and "3 to resolve" in caplog.text
 
 
+def test_trash_duplicates_trashes_external_copies_in_named_folders(tmp_path, caplog):
+    api = FakeApi()
+    page, old_copy, other_ext = asset("/x/Comics/a/1.png"), asset("/x/Old/1.png", library_id=uuid4()), asset("/x/Discord/1.png", library_id=uuid4())
+    group = NS(duplicate_id=uuid4(), assets=[page, old_copy, other_ext])
+    api.duplicates = [group]
+    text = KEEP_RULE + "  - match: {path_like: ['/Old/']}\n    actions: {trash_duplicates: true}\n"
+    with caplog.at_level(logging.INFO):
+        run(make(tmp_path, text, api), [])
+    assert ("resolve_duplicates", [(group.duplicate_id, [page.id, other_ext.id], [old_copy.id])]) in api.calls
+    assert "external copy left in place /x/Discord/1.png" in caplog.text
+
+
 def test_dismiss_wins_over_keep_for_a_group_fully_inside(tmp_path):
     api = FakeApi()
     inside = NS(duplicate_id=uuid4(), assets=[asset("/x/Comics/a/1.png"), asset("/x/Comics/a/Textless/1.png")])

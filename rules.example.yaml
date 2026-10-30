@@ -329,3 +329,7 @@ rules:
   #     visibility: archive        # archive, hidden or timeline
   #     dismiss_duplicates: true   # a page with and without text is no duplicate: dismiss groups whose members all lie in /Comics/
   #     keep_duplicates: true      # a copy of a page uploaded elsewhere is a duplicate: keep the page here, trash the copy
+  # - match:
+  #     path_like: ["/Old exports/"]
+  #   actions:
+  #     trash_duplicates: true     # external copies in this folder lose against the kept page, file deleted when the trash expires
