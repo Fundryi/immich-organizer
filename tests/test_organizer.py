@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 from uuid import uuid4
 
+from immichpy.client.generated.exceptions import ApiException
+
 import pytest
 
 from organizer import Organizer, fix_mojibake, folder_name_for, matches, natural_key, parse_rule_file
@@ -37,6 +39,7 @@ class FakeApi:
         self.albums = []
         self.album_members = {}
         self.duplicates = []
+        self.gone = set()
         self.busy_polls = 0
         self.paused = False
         self.queue_error = None
@@ -124,6 +127,8 @@ class FakeApi:
         self.calls.append(("dismiss_duplicates", list(ids)))
 
     def resolve_duplicates(self, groups):
+        if any(g[0] in self.gone for g in groups):
+            raise ApiException(status=400, reason="Bad Request")
         self.calls.append(("resolve_duplicates", list(groups)))
 
     def fetch_queues(self):
@@ -468,6 +473,18 @@ def test_keep_duplicates_keeps_matching_members_and_trashes_every_other_copy(tmp
     ], key=lambda g: str(g[0]))
     assert "dismiss_duplicates" not in api.names()
     assert "3 to resolve" in caplog.text
+
+
+def test_a_group_gone_since_the_plan_is_skipped_and_the_rest_of_the_batch_written(tmp_path, caplog):
+    api = FakeApi()
+    groups = [NS(duplicate_id=uuid4(), assets=[asset(f"/x/Comics/a/{i}.png"), asset(f"/data/Other/{i}.png")]) for i in range(3)]
+    api.duplicates = groups
+    api.gone = {groups[1].duplicate_id}
+    with caplog.at_level(logging.WARNING):
+        run(make(tmp_path, KEEP_RULE, api), [])
+    written = sorted(g[0] for c in api.calls if c[0] == "resolve_duplicates" for g in c[1])
+    assert written == sorted([groups[0].duplicate_id, groups[2].duplicate_id])
+    assert f"skipped {groups[1].duplicate_id}, changed since the plan was made" in caplog.text
 
 
 def test_dismiss_wins_over_keep_for_a_group_fully_inside(tmp_path):

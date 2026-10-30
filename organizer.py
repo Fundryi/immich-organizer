@@ -19,6 +19,7 @@ from typing import Any, Callable
 import regex
 import yaml
 from immichpy.client.generated import AssetVisibility
+from immichpy.client.generated.exceptions import ApiException
 
 BATCH_SIZE = 50
 WATCHED_QUEUES = ("sidecar", "metadataExtraction", "storageTemplateMigration")
@@ -720,7 +721,17 @@ class Organizer:
     def _in_batches(self, ids: set[Any], write: Callable[[list[Any]], Any], queue_client: Any) -> None:
         ordered = sorted(ids, key=str)
         for start in range(0, len(ordered), BATCH_SIZE):
-            write(ordered[start:start + BATCH_SIZE])
+            batch = ordered[start:start + BATCH_SIZE]
+            try:
+                write(batch)
+            except ApiException:
+                # Immich rejects a whole batch when one id is gone (a duplicate group resolved in the UI or by another
+                # run since the plan was made); write the rest one by one and skip what is gone.
+                for one in batch:
+                    try:
+                        write([one])
+                    except ApiException as e:
+                        logging.warning("Rules: skipped %s, changed since the plan was made: %s", one, e.body or e.status)
             self._wait_idle(queue_client)
 
     def _wait_idle(self, queue_client: Any) -> None:
