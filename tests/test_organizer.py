@@ -447,42 +447,27 @@ def test_dismiss_duplicates_only_groups_whose_members_all_match(tmp_path):
 KEEP_RULE = "rules:\n  - match: {path_like: ['/Comics/']}\n    actions: {keep_duplicates: true}\n"
 
 
-def test_keep_duplicates_keeps_matching_members_and_trashes_the_other_uploads(tmp_path, caplog):  # pylint: disable=too-many-locals
+def test_keep_duplicates_keeps_matching_members_and_trashes_every_other_copy(tmp_path, caplog):
     api = FakeApi()
     page, upload = asset("/x/Comics/a/1.png"), asset("/data/Other/1.png")
-    page2, ext = asset("/x/Comics/a/2.png"), asset("/x/Discord/2.png", library_id=uuid4())
-    page3, upload3, ext3 = asset("/x/Comics/a/3.png"), asset("/data/Other/3.png"), asset("/x/Discord/3.png", library_id=uuid4())
+    page2, ext = asset("/x/Comics/a/2.png"), asset("/x/Old/2.png", library_id=uuid4())
     text4, textless4, upload4 = asset("/x/Comics/a/4.png"), asset("/x/Comics/a/Textless/4.png"), asset("/data/Other/4.png")
     both_outside = NS(duplicate_id=uuid4(), assets=[asset("/data/Other/5.png"), asset("/data/Other/5 (1).png")])
     plain = NS(duplicate_id=uuid4(), assets=[page, upload])
     external = NS(duplicate_id=uuid4(), assets=[page2, ext])
-    mixed = NS(duplicate_id=uuid4(), assets=[page3, upload3, ext3])
     two_keepers = NS(duplicate_id=uuid4(), assets=[text4, textless4, upload4])
-    api.duplicates = [plain, external, mixed, two_keepers, both_outside]
+    api.duplicates = [plain, external, two_keepers, both_outside]
     with caplog.at_level(logging.INFO):
         run(make(tmp_path, KEEP_RULE, api), [])
     resolved = [c for c in api.calls if c[0] == "resolve_duplicates"]
     assert len(resolved) == 1
     assert sorted(resolved[0][1], key=lambda g: str(g[0])) == sorted([
         (plain.duplicate_id, [page.id], [upload.id]),
-        (mixed.duplicate_id, [page3.id, ext3.id], [upload3.id]),
+        (external.duplicate_id, [page2.id], [ext.id]),
         (two_keepers.duplicate_id, [text4.id, textless4.id], [upload4.id]),
     ], key=lambda g: str(g[0]))
     assert "dismiss_duplicates" not in api.names()
-    assert "external copy left in place /x/Discord/2.png" in caplog.text
-    assert "1 to resolve" not in caplog.text and "3 to resolve" in caplog.text
-
-
-def test_trash_duplicates_trashes_external_copies_in_named_folders(tmp_path, caplog):
-    api = FakeApi()
-    page, old_copy, other_ext = asset("/x/Comics/a/1.png"), asset("/x/Old/1.png", library_id=uuid4()), asset("/x/Discord/1.png", library_id=uuid4())
-    group = NS(duplicate_id=uuid4(), assets=[page, old_copy, other_ext])
-    api.duplicates = [group]
-    text = KEEP_RULE + "  - match: {path_like: ['/Old/']}\n    actions: {trash_duplicates: true}\n"
-    with caplog.at_level(logging.INFO):
-        run(make(tmp_path, text, api), [])
-    assert ("resolve_duplicates", [(group.duplicate_id, [page.id, other_ext.id], [old_copy.id])]) in api.calls
-    assert "external copy left in place /x/Discord/1.png" in caplog.text
+    assert "3 to resolve" in caplog.text
 
 
 def test_dismiss_wins_over_keep_for_a_group_fully_inside(tmp_path):

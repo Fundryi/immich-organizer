@@ -31,7 +31,7 @@ TOP_LEVEL_KEYS = {"keep_empty_albums", "repair_names", "rename_tags", "rename_al
 TEXT_MATCH_KEYS = {"path_like", "path_not_like", "name_like", "name_regex", "extension", "type", "account", "make_like", "model_like"}
 NUMBER_MATCH_KEYS = {"min_size_mb", "max_size_mb", "min_long_side", "max_long_side", "min_duration_s", "max_duration_s"}
 TAG_GROUP = re.compile(r"\{(\d)\}")
-ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility", "order_by_name", "dismiss_duplicates", "keep_duplicates", "trash_duplicates"}
+ACTION_KEYS = {"tag", "folder_tag", "folder_album", "album", "visibility", "order_by_name", "dismiss_duplicates", "keep_duplicates"}
 FOLDER_SPEC_KEYS = {"folder_tag": {"prefix"}, "folder_album": {"prefix", "order"}, "order_by_name": set()}
 ALBUM_SEPARATOR = " / "
 ALBUM_ORDERS = {"asc", "desc"}
@@ -138,7 +138,7 @@ def _check_rule(where: str, rule: Any) -> dict[str, Any]:
         _fail(f"{where}.actions.album", "must be a non-empty string")
     if "visibility" in actions and actions["visibility"] not in VISIBILITIES:
         _fail(f"{where}.actions.visibility", f"must be one of {', '.join(sorted(VISIBILITIES))}")
-    for key in [k for k in ("dismiss_duplicates", "keep_duplicates", "trash_duplicates") if k in actions and actions[k] is not True]:
+    for key in [k for k in ("dismiss_duplicates", "keep_duplicates") if k in actions and actions[k] is not True]:
         _fail(f"{where}.actions.{key}", "must be true")
     for key, extra in FOLDER_SPEC_KEYS.items():
         if key in actions:
@@ -566,7 +566,7 @@ class Organizer:
                     plan.group_matches[actions["order_by_name"]["strip_prefix"] + group].append(rule["match"])
                 if "visibility" in actions:
                     visibilities.append(actions["visibility"])
-                if any(key in actions for key in ("dismiss_duplicates", "keep_duplicates", "trash_duplicates")):
+                if "dismiss_duplicates" in actions or "keep_duplicates" in actions:
                     plan.duplicates_hit = True
             if len(set(visibilities)) > 1:
                 logging.warning("Rules give %s more than one visibility, the last matching rule wins", asset.original_path)
@@ -584,12 +584,10 @@ class Organizer:
         # outside the rule and the group stays, those are real duplicates. Dismissed groups leave GET /duplicates, so
         # there is no done-check and a rerun after the admin job "Duplicate detection: ALL" dismisses them again.
         # Otherwise, when some members match a keep_duplicates rule, those are kept and the others go to the trash
-        # (Immich's resolve, which also copies albums, tags and favorite onto a single kept asset). Members that are
-        # external library files are only trashed when they match a trash_duplicates rule, because Immich deletes
-        # the file on disk when the trash expires; otherwise they are logged and left alone.
+        # (Immich's resolve, which also copies albums, tags and favorite onto a single kept asset). External library
+        # members are trashed too; Immich deletes their file on disk when the trash expires.
         dismiss = [rule["match"] for rule in self.rules["rules"] if "dismiss_duplicates" in rule["actions"]]
         keep = [rule["match"] for rule in self.rules["rules"] if "keep_duplicates" in rule["actions"]]
-        lose = [rule["match"] for rule in self.rules["rules"] if "trash_duplicates" in rule["actions"]]
         if not dismiss and not keep:
             return
         if getattr(self.api_client.config, "updated_after", None) and not plan.duplicates_hit:
@@ -604,12 +602,7 @@ class Organizer:
             others = [m for m in group.assets if m not in keepers]
             if not keepers or not others:
                 continue
-            external = [m for m in others if m.library_id and not any(matches(match, m, me) for match in lose)]
-            trash = [m for m in others if m not in external]
-            for member in external:
-                logging.info("Rules: duplicate group %s: external copy left in place %s", group.duplicate_id, member.original_path)
-            if trash:
-                plan.keeps[group.duplicate_id] = (keepers + external, trash)
+            plan.keeps[group.duplicate_id] = (keepers, others)
         logging.info("Rules: %d of %d duplicate groups to dismiss, %d to resolve", len(plan.duplicates), len(groups), len(plan.keeps))
 
     def _complete_groups(self, plan: Plan) -> None:
